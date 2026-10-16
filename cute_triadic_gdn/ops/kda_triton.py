@@ -106,6 +106,52 @@ def _gram_fwd_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr
         tl.store(pkk + out_rows + cols, zero)
 
 
+@triton.autotune(
+    configs=[triton.Config({"BS": bs}, num_warps=w, num_stages=st)
+             for bs in (16, 32) for w in (2, 4, 8) for st in (1, 2)],
+    key=["T", "H", "D"],
+)
+@triton.jit
+def _gram_fwd_rows_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr, BS: tl.constexpr):
+    """As _gram_fwd_kernel, with the diagonal block one row at a time (a [BS, D] exponential tile per row
+    instead of a [BS, BS, BD] one) over the whole head dim."""
+    n, bh, x = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    b, h = bh // H, bh % H
+    qh, kh, gh = qs + h * D, ks + h * D, gd + h * D
+    t = tl.arange(0, BS)
+    dd = tl.arange(0, D)
+    rowx = b * T + n * C + x * BS
+    out_rows = ((rowx + t[:, None]) * H + h) * C
+    offx = (rowx + t[:, None]) * H * D + dd[None, :]
+    gx = tl.load(gh + offx)
+    kx = tl.load(kh + offx).to(tl.float32)
+    # diagonal block: row r against the block's rows s
+    for r in tl.static_range(BS):
+        offr = (rowx + r) * H * D + dd
+        gr = tl.load(gh + offr)
+        ke = kx * tl.exp(tl.minimum(gr[None, :] - gx, 0.0))
+        prow = ((rowx + r) * H + h) * C + x * BS + t
+        tl.store(pq + prow, tl.where(t <= r, tl.sum(tl.load(qh + offr).to(tl.float32)[None, :] * ke, axis=1), 0.0))
+        tl.store(pkk + prow, tl.where(t < r, tl.sum(tl.load(kh + offr).to(tl.float32)[None, :] * ke, axis=1), 0.0))
+    # off-diagonal blocks J < X: factored at the first row of X (both factors <= 1), tensor-core dots
+    gr = tl.load(gh + rowx * H * D + dd)
+    ei = tl.exp(gx - gr[None, :])
+    lq = tl.load(qh + offx).to(tl.float32) * ei
+    lk = kx * ei
+    for j in tl.range(0, x):
+        rowj = b * T + n * C + j * BS
+        offj = (rowj + t[:, None]) * H * D + dd[None, :]
+        rj = tl.load(kh + offj).to(tl.float32) * tl.exp(gr[None, :] - tl.load(gh + offj))
+        cols = j * BS + t[None, :]
+        tl.store(pq + out_rows + cols, tl.dot(lq, tl.trans(rj)))
+        tl.store(pkk + out_rows + cols, tl.dot(lk, tl.trans(rj)))
+    for j in tl.range(x + 1, C // BS):
+        cols = j * BS + t[None, :]
+        zero = tl.zeros((BS, BS), tl.float32)
+        tl.store(pq + out_rows + cols, zero)
+        tl.store(pkk + out_rows + cols, zero)
+
+
 @triton.autotune(configs=_GRAM_CONFIGS, key=["T", "H", "D"])
 @triton.jit
 def _gram_bwd_kernel(qs, ks, gd, dpkk, dpq, dqs, dks, dgd, T, H, D: tl.constexpr, C: tl.constexpr,
@@ -229,6 +275,16 @@ def gram_fwd(qs, ks, gd):
     pkk = torch.empty(B, T, H, C, device=qs.device, dtype=torch.float32)
     pq = torch.empty_like(pkk)
     grid = lambda meta: (T // C, B * H, C // meta["BS"])  # noqa: E731
+    _gram_fwd_rows_kernel[grid](qs, ks, gd, pkk, pq, T, H, D, C)
+    return pkk, pq
+
+
+def gram_fwd_triton(qs, ks, gd):
+    """The previous Gram forward (diagonal block by [BS, BS, BD] pairwise exponentials)."""
+    B, T, H, D = qs.shape
+    pkk = torch.empty(B, T, H, C, device=qs.device, dtype=torch.float32)
+    pq = torch.empty_like(pkk)
+    grid = lambda meta: (T // C, B * H, C // meta["BS"])  # noqa: E731
     _gram_fwd_kernel[grid](qs, ks, gd, pkk, pq, T, H, D, C)
     return pkk, pq
 
@@ -254,19 +310,24 @@ def gram_bwd(qs, ks, gd, dpkk, dpq):
     """(dqs, dks, dGd) fp32 (B, T, H, D) from the gradients of Pkk and Pq (B, T, H, 64) fp32.
 
     The products are those of KDA's intra-chunk attention (beta = 1, scale = 1), so by default
-    flash-linear-attention's tuned intra-chunk backward computes them (it works in base 2: the
-    gate goes in times log2(e) and its gradient comes out divided by it); the Triton kernel
-    below is the fallback (CUTE_KDA_GRAM_BWD=triton)."""
+    flash-linear-attention's tuned intra-chunk backward computes them. It takes the gate in base 2
+    (times log2(e)) but returns the gate gradient for the natural-log gate, and it reads the whole
+    row of dAqk / dAkk, so the entries outside the products' triangles are zeroed first. The Triton kernel below
+    is the fallback (CUTE_KDA_GRAM_BWD=triton)."""
     fla_bwd = _fla_intra_bwd()
     if fla_bwd is not None:
         B, T, H, D = qs.shape
+        t = torch.arange(C, device=qs.device)
+        lower = (t[:, None] >= t[None, :]).repeat(T // C, 1)[None, :, None, :]
+        strict = (t[:, None] > t[None, :]).repeat(T // C, 1)[None, :, None, :]
         zeros = torch.zeros(B, T, H, D, device=qs.device, dtype=torch.float32)
         beta = torch.ones(B, T, H, device=qs.device, dtype=torch.float32)
         dq, dk, _, dg = fla_bwd(
-            q=qs, k=ks, g=gd * _LOG2E, beta=beta, dAqk=dpq.contiguous(), dAkk=dpkk.contiguous(),
+            q=qs, k=ks, g=gd * _LOG2E, beta=beta,
+            dAqk=dpq.masked_fill(~lower, 0.0), dAkk=dpkk.masked_fill(~strict, 0.0),
             dq=zeros, dk=zeros.clone(), db=torch.zeros_like(beta), dg=zeros.clone(), chunk_size=C,
         )
-        return dq.float(), dk.float(), dg.float() * _LOG2E
+        return dq.float(), dk.float(), dg.float()
     return gram_bwd_triton(qs, ks, gd, dpkk, dpq)
 
 
