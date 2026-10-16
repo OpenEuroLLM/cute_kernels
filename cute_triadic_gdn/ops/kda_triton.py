@@ -52,6 +52,14 @@ def _prep_kernel(q, k, g, sign, qs_out, ks_out, qd_out, kd_out, ku_out, gd_out, 
     tl.store(lam_out + ((b * (T // C) + n) * H + h) * D + cols, sig_l * tl.exp(gd_l))
 
 
+_GRAM_CONFIGS = [
+    triton.Config({"BS": bs, "BD": bd}, num_warps=w)
+    for bs in (16, 32) for bd in (16, 32, 64) for w in (4, 8)
+    if bs * bs * bd <= 32 * 32 * 32  # the diagonal block's [BS, BS, BD] exponentials
+]
+
+
+@triton.autotune(configs=_GRAM_CONFIGS, key=["T", "H", "D"])
 @triton.jit
 def _gram_fwd_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr, BS: tl.constexpr,
                      BD: tl.constexpr):
@@ -98,6 +106,7 @@ def _gram_fwd_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr
         tl.store(pkk + out_rows + cols, zero)
 
 
+@triton.autotune(configs=_GRAM_CONFIGS, key=["T", "H", "D"])
 @triton.jit
 def _gram_bwd_kernel(qs, ks, gd, dpkk, dpq, dqs, dks, dgd, T, H, D: tl.constexpr, C: tl.constexpr,
                      BS: tl.constexpr, BD: tl.constexpr):
@@ -219,7 +228,8 @@ def gram_fwd(qs, ks, gd):
     B, T, H, D = qs.shape
     pkk = torch.empty(B, T, H, C, device=qs.device, dtype=torch.float32)
     pq = torch.empty_like(pkk)
-    _gram_fwd_kernel[(T // C, B * H, C // BS)](qs, ks, gd, pkk, pq, T, H, D, C, BS, 32, num_warps=8)
+    grid = lambda meta: (T // C, B * H, C // meta["BS"])  # noqa: E731
+    _gram_fwd_kernel[grid](qs, ks, gd, pkk, pq, T, H, D, C)
     return pkk, pq
 
 
@@ -228,6 +238,6 @@ def gram_bwd(qs, ks, gd, dpkk, dpq):
     B, T, H, D = qs.shape
     dqs = torch.empty(B, T, H, D, device=qs.device, dtype=torch.float32)
     dks, dgd = torch.empty_like(dqs), torch.empty_like(dqs)
-    _gram_bwd_kernel[(T // C, B * H, C // BS)](qs, ks, gd, dpkk.contiguous(), dpq.contiguous(), dqs, dks, dgd,
-                                               T, H, D, C, BS, 32, num_warps=4)
+    grid = lambda meta: (T // C, B * H, C // meta["BS"])  # noqa: E731
+    _gram_bwd_kernel[grid](qs, ks, gd, dpkk.contiguous(), dpq.contiguous(), dqs, dks, dgd, T, H, D, C)
     return dqs, dks, dgd
