@@ -72,3 +72,26 @@ def test_cute_against_torch_pipeline(B, T, H, E, signed, gate_scale):
     assert rel(o_c, o_t) < 2e-2, f"forward {rel(o_c, o_t):.3e}"
     for name, a, b in zip(NAMES, g_c, g_t):
         assert rel(a, b) < 5e-2, f"grad {name}: {rel(a, b):.3e}"
+
+
+@pytest.mark.skipif(not _hopper(), reason="needs sm90")
+@pytest.mark.parametrize("gate_scale", [0.5, 4.0])
+def test_gram_bwd_fla_matches_triton(gate_scale):
+    """flash-linear-attention's intra-chunk backward == the Triton Gram backward."""
+    from cute_triadic_gdn.ops import kda_triton as kt
+
+    if kt._fla_intra_bwd() is None:
+        pytest.skip("flash-linear-attention not importable")
+    torch.manual_seed(0)
+    B, T, H, D = 2, 256, 3, 128
+    qs = torch.randn(B, T, H, D, device="cuda").div(D ** 0.5).bfloat16()
+    ks = torch.randn(B, T, H, D, device="cuda").div(D ** 0.5).bfloat16()
+    g = -gate_scale * torch.rand(B, T, H, D, device="cuda") / 16
+    gd = g.view(B, T // 64, 64, H, D).cumsum(2).view(B, T, H, D)
+    dpkk = torch.randn(B, T, H, 64, device="cuda")
+    dpq = torch.randn(B, T, H, 64, device="cuda")
+    ref = kt.gram_bwd_triton(qs, ks, gd, dpkk, dpq)
+    got = kt.gram_bwd(qs, ks, gd, dpkk, dpq)
+    for name, a, b in zip(("dq", "dk", "dg"), got, ref):
+        err = (a - b).norm() / b.norm()
+        assert err < 2e-2, (name, float(err))

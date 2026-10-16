@@ -233,8 +233,45 @@ def gram_fwd(qs, ks, gd):
     return pkk, pq
 
 
+_LOG2E = 1.4426950408889634
+
+
+def _fla_intra_bwd():
+    """flash-linear-attention's KDA intra-chunk backward, or None (not installed / disabled with
+    CUTE_KDA_GRAM_BWD=triton)."""
+    import os
+
+    if os.environ.get("CUTE_KDA_GRAM_BWD", "fla") != "fla":
+        return None
+    try:
+        from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
+    except ImportError:
+        return None
+    return chunk_kda_bwd_intra
+
+
 def gram_bwd(qs, ks, gd, dpkk, dpq):
-    """(dqs, dks, dGd) fp32 (B, T, H, D) from the gradients of Pkk and Pq (B, T, H, 64) fp32."""
+    """(dqs, dks, dGd) fp32 (B, T, H, D) from the gradients of Pkk and Pq (B, T, H, 64) fp32.
+
+    The products are those of KDA's intra-chunk attention (beta = 1, scale = 1), so by default
+    flash-linear-attention's tuned intra-chunk backward computes them (it works in base 2: the
+    gate goes in times log2(e) and its gradient comes out divided by it); the Triton kernel
+    below is the fallback (CUTE_KDA_GRAM_BWD=triton)."""
+    fla_bwd = _fla_intra_bwd()
+    if fla_bwd is not None:
+        B, T, H, D = qs.shape
+        zeros = torch.zeros(B, T, H, D, device=qs.device, dtype=torch.float32)
+        beta = torch.ones(B, T, H, device=qs.device, dtype=torch.float32)
+        dq, dk, _, dg = fla_bwd(
+            q=qs, k=ks, g=gd * _LOG2E, beta=beta, dAqk=dpq.contiguous(), dAkk=dpkk.contiguous(),
+            dq=zeros, dk=zeros.clone(), db=torch.zeros_like(beta), dg=zeros.clone(), chunk_size=C,
+        )
+        return dq.float(), dk.float(), dg.float() * _LOG2E
+    return gram_bwd_triton(qs, ks, gd, dpkk, dpq)
+
+
+def gram_bwd_triton(qs, ks, gd, dpkk, dpq):
+    """The Triton Gram backward (see gram_bwd)."""
     B, T, H, D = qs.shape
     dqs = torch.empty(B, T, H, D, device=qs.device, dtype=torch.float32)
     dks, dgd = torch.empty_like(dqs), torch.empty_like(dqs)
