@@ -3,9 +3,10 @@ state-dependent gradients, with the untied channel-decayed operands of the KDA f
 
   recurrent    dS_start = exp(g2_L,e) lam (x) dS_end + kd^T VN + qd^T VR per slice (lam: per-channel decay), and
                dVd = sum_e r_e (ku dS_e) + Pm^T dO with the precomputed readout Pm; stores dS_end of every chunk.
-  state grads  dqd (readout), dkd (state read) and dku (state update) separately, and the slice partials; the
-               per-channel chunk-decay trace is formed outside (kda_cute.py), so the slice decay partial here
-               leaves out the exp(g2_L) <S_start, dS_end> term the GDN kernel adds.
+  state grads  dqd (readout), dkd (state read) and dku (state update) separately, the slice partials, and the
+               per-channel chunk-decay trace <S_start, dS_end> row by row (B, NC, H, E, D): the decay gradients
+               (slice and channel) are formed from it in kda_cute.py, so the slice decay partial here leaves out
+               the exp(g2_L) <S_start, dS_end> term the GDN kernel adds.
 """
 import torch
 import cuda.bindings.driver as cuda
@@ -290,7 +291,7 @@ def recurrent_kernel(q:cute.Tensor,k:cute.Tensor,do:cute.Tensor,A:cute.Tensor,Mp
 def state_grads_kernel(q:cute.Tensor,k:cute.Tensor,ku:cute.Tensor,do:cute.Tensor,vd:cute.Tensor,dwf:cute.Tensor,
                        gc:cute.Tensor,k2:cute.Tensor,q2:cute.Tensor,h:cute.Tensor,ds:cute.Tensor,
                        dqp:cute.Tensor,dkp:cute.Tensor,dkup:cute.Tensor,dgv:cute.Tensor,dk2v:cute.Tensor,dgo:cute.Tensor,dq2o:cute.Tensor,
-                       tmaH:cute.CopyAtom,tHt:cute.Tensor,tmaDS:cute.CopyAtom,tDSt:cute.Tensor,offsets:cute.Tensor,mapping:cute.Tensor,
+                       trace:cute.Tensor,tmaH:cute.CopyAtom,tHt:cute.Tensor,tmaDS:cute.CopyAtom,tDSt:cute.Tensor,offsets:cute.Tensor,mapping:cute.Tensor,
                        mmaU:cute.TiledMma,mmaG:cute.TiledMma,
                        lK:cute.ComposedLayout,lH:cute.ComposedLayout,lHg:cute.ComposedLayout,
                        H:cutlass.Constexpr,E:cutlass.Constexpr,NC:cutlass.Constexpr,SCALE:cutlass.Constexpr,PACKED:cutlass.Constexpr,NATIVE:cutlass.Constexpr,NBLK:cutlass.Constexpr,NITEMS:cutlass.Constexpr):
@@ -459,6 +460,23 @@ def state_grads_kernel(q:cute.Tensor,k:cute.Tensor,ku:cute.Tensor,do:cute.Tensor
                         if activex:
                             issue_slot(tid,tmaH,tHg,tHs,tmaDS,tDSg,tDSs,ready,1-stage,0,bx,nx,bhx)
                             prefetched=cutlass.Boolean(True)
+                # <S_start, dS_end> per state row d (one row: 16 lanes of 8 values each)
+                for j in cutlass.range_constexpr(D*D//(2*WG*8)):
+                    pos=j*2*WG+tid
+                    row,col=pos//(D//8),(pos%(D//8))*8
+                    byteoff=sH.layout((col,row,stage))*2
+                    shift=cutlass.const_expr(lH.inner.num_shift)
+                    mask=cutlass.const_expr(((1<<lH.inner.num_bits)-1)<<(lH.inner.num_base+shift))
+                    off=(byteoff ^ ((byteoff & mask)>>shift))//2
+                    vh=cute.make_tensor((cute.recast_ptr(sH.iterator,dtype=cutlass.BFloat16)+off).align(16),cute.make_layout(8)).load()
+                    vs=cute.make_tensor((cute.recast_ptr(sDS.iterator,dtype=cutlass.BFloat16)+off).align(16),cute.make_layout(8)).load()
+                    rdot=cutlass.Float32(0.)
+                    for z in cutlass.range_constexpr(8):
+                        rdot=rdot+cutlass.Float32(vh[z])*cutlass.Float32(vs[z])
+                    for sh in (8,4,2,1):
+                        rdot=rdot+cute.arch.shuffle_sync_bfly(rdot,sh)
+                    if tid%16==0:
+                        trace[b,n,bh,e,row]=rdot
                 if tid<C:
                     eg=cute.math.exp(sg[e,tid],fastmath=True)
                     sa[tid]=sk2[e,tid]*eg
@@ -548,7 +566,7 @@ def launch_recurrent(q:cute.Tensor,k:cute.Tensor,do:cute.Tensor,A:cute.Tensor,Mp
 @cute.jit
 def launch_state_grads(q:cute.Tensor,k:cute.Tensor,ku:cute.Tensor,do:cute.Tensor,vd:cute.Tensor,dwf:cute.Tensor,
                        gc:cute.Tensor,k2:cute.Tensor,q2:cute.Tensor,h:cute.Tensor,ds:cute.Tensor,
-                       dqp:cute.Tensor,dkp:cute.Tensor,dkup:cute.Tensor,dgv:cute.Tensor,dk2v:cute.Tensor,dgo:cute.Tensor,dq2o:cute.Tensor,gHT:cute.Tensor,gDST:cute.Tensor,offsets:cute.Tensor,mapping:cute.Tensor,
+                       dqp:cute.Tensor,dkp:cute.Tensor,dkup:cute.Tensor,dgv:cute.Tensor,dk2v:cute.Tensor,dgo:cute.Tensor,dq2o:cute.Tensor,trace:cute.Tensor,gHT:cute.Tensor,gDST:cute.Tensor,offsets:cute.Tensor,mapping:cute.Tensor,
                        B:cutlass.Constexpr,H:cutlass.Constexpr,E:cutlass.Constexpr,NC:cutlass.Constexpr,
                        SCALE:cutlass.Constexpr,PACKED:cutlass.Constexpr,NATIVE:cutlass.Constexpr,stream:cuda.CUstream):
     bf,ff=cutlass.BFloat16,cutlass.Float32
@@ -561,7 +579,7 @@ def launch_state_grads(q:cute.Tensor,k:cute.Tensor,ku:cute.Tensor,do:cute.Tensor
         cute.slice_(lH,(None,None,0)),(D,D),1)
     tmaDS,tDSt=cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(),gDST,
         cute.slice_(lH,(None,None,0)),(D,D),1)
-    state_grads_kernel(q,k,ku,do,vd,dwf,gc,k2,q2,h,ds,dqp,dkp,dkup,dgv,dk2v,dgo,dq2o,
+    state_grads_kernel(q,k,ku,do,vd,dwf,gc,k2,q2,h,ds,dqp,dkp,dkup,dgv,dk2v,dgo,dq2o,trace,
         tmaH,tHt,tmaDS,tDSt,offsets,mapping,mmaU,mmaG,lK,lH,lHg,H,E,NC,SCALE,PACKED,NATIVE,min(B*NC*H,132),B*NC*H).launch(grid=(min(B*NC*H,132),1,1),block=(2*WG,1,1),stream=stream)
 
 
@@ -569,9 +587,9 @@ _compiled={}
 
 
 def kda_bwd_recurrent(qd,kd,ku,do,A,Pm,gc,k2,q2,beta,lam,h,Vd,scale=None,groups=2,value_cols=None):
-    """(dqd, dkd, dku, dv, dvd, dgv, dk2v, dgo, dq2o, ds): the state-dependent gradients (fp32, (B,T,H,D) for
-    the operands), dv (bf16), dvd (bf16), the slice partials (B,T,H,1,E) and the end-of-chunk state gradients
-    ds (B,NC,H,E,D,D) bf16.  No packed documents."""
+    """(dqd, dkd, dku, dv, dvd, dgv, dk2v, dgo, dq2o, trace): the state-dependent gradients (fp32, (B,T,H,D) for
+    the operands), dv (bf16), dvd (bf16), the slice partials (B,T,H,1,E) and the per-row chunk-decay trace
+    <S_start, dS_end> (B,NC,H,E,D) fp32.  No packed documents."""
     B,T,H,D_=qd.shape
     E,NC=k2.shape[-1],T//C
     assert D_==D and T%C==0 and E in (1,2,4,8,12,16) and groups in (1,2,4) and E%groups==0
@@ -586,6 +604,7 @@ def kda_bwd_recurrent(qd,kd,ku,do,A,Pm,gc,k2,q2,beta,lam,h,Vd,scale=None,groups=
     dv,dvd=torch.empty_like(do),empty((B,T,H,D),do.dtype)
     dqp,dkp,dkup=(empty((B,T,H,1,D)) for _ in range(3))
     dgv,dk2v,dgo,dq2o=(empty((B,T,H,1,E)) for _ in range(4))
+    trace=empty((B,NC,H,E,D))
     def chunks(t):
         return t.view(B,NC,C,*t.shape[2:])
     recurrent=tuple(chunks(t) for t in (qd,kd,do,A,Pm,gc,k2,q2,beta))+(lam,ds,chunks(dwf),chunks(dv),chunks(dvd),
@@ -594,7 +613,7 @@ def kda_bwd_recurrent(qd,kd,ku,do,A,Pm,gc,k2,q2,beta,lam,h,Vd,scale=None,groups=
     recurrent+=(chunks(do).permute(4,2,0,1,3),)
     recurrent+=tuple(chunks(t).permute(2,4,0,1,3) for t in (A,Pm))
     parallel=tuple(chunks(t) for t in (qd,kd,ku,do,Vd,dwf,gc,k2,q2))+(h.view_as(ds),ds)+tuple(
-        chunks(t) for t in (dqp,dkp,dkup,dgv,dk2v,dgo,dq2o))
+        chunks(t) for t in (dqp,dkp,dkup,dgv,dk2v,dgo,dq2o))+(trace,)
     parallel+=tuple(t.view(B,NC,H,E*D,D).permute(4,3,0,1,2) for t in (h,ds))
     ra=[from_dlpack(t.detach(),assumed_align=16) for t in recurrent]
     pa=[from_dlpack(t.detach(),assumed_align=16) for t in parallel]
@@ -609,4 +628,4 @@ def kda_bwd_recurrent(qd,kd,ku,do,A,Pm,gc,k2,q2,beta,lam,h,Vd,scale=None,groups=
     rec,par=_compiled[key]
     rec(*ra,B,stream)
     par(*pa,stream)
-    return dqp[:,:,:,0],dkp[:,:,:,0],dkup[:,:,:,0],dv,dvd,dgv,dk2v,dgo,dq2o,ds
+    return dqp[:,:,:,0],dkp[:,:,:,0],dkup[:,:,:,0],dv,dvd,dgv,dk2v,dgo,dq2o,trace

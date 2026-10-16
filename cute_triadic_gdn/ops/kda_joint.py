@@ -91,6 +91,7 @@ class _KdaJoint(torch.autograd.Function):
         else:
             from .kda_cute import cute_forward
             o, saved_fwd = cute_forward(qd, kd, ku, pkk, pq, lam, v, k2, q2, g2, beta, scale)
+            saved_fwd = (*saved_fwd, pkk, pq)
         ctx.save_for_backward(q, k, v, k2, q2, g2, g, beta, sign, *saved_fwd)
         ctx.scale, ctx.backend = scale, backend
         return o.to(v.dtype)
@@ -99,12 +100,13 @@ class _KdaJoint(torch.autograd.Function):
     def backward(ctx, do):
         q, k, v, k2, q2, g2, g, beta, sign, *saved_fwd = ctx.saved_tensors
         qs, ks, qd, kd, ku, gd, lam = kt.prep(q, k, g, sign)                     # recomputed: cheap
-        pkk, pq = kt.gram_fwd(qs, ks, gd)
         if ctx.backend == "torch":
+            pkk, pq = kt.gram_fwd(qs, ks, gd)
             _, gr = _torch_stages((qd, kd, ku, pkk, pq, lam), v, k2, q2, g2, beta, ctx.scale, do)
             dqd, dkd, dku, dpkk, dpq, dlam, dv, dk2, dq2, dg2, db = gr
         else:
             from .kda_cute import cute_backward
+            *saved_fwd, pkk, pq = saved_fwd
             dqd, dkd, dku, dpkk, dpq, dlam, dv, dk2, dq2, dg2, db = cute_backward(
                 qd, kd, ku, lam, v, k2, q2, g2, beta, ctx.scale, do.contiguous(), saved_fwd, pkk, pq)
         dqs_g, dks_g, dgd_g = kt.gram_bwd(qs, ks, gd, dpkk.float(), dpq.float())

@@ -31,14 +31,13 @@ def cute_backward(qd, kd, ku, lam, v, k2, q2, g2, beta, scale, do, saved, pkk, p
     gc, A, Mp, M, Pm, h, W, Vd = saved
     B, T, H, D = qd.shape
     E, NC = k2.shape[-1], T // C
-    dqd, dkd, dku, dv, dvd, dgv, dk2v, dgo, dq2o, ds = kda_bwd_recurrent(
+    dqd, dkd, dku, dv, dvd, dgv, dk2v, dgo, dq2o, trace = kda_bwd_recurrent(
         qd, kd, ku, do, A, Pm, gc, k2, q2, beta, lam, h, Vd, scale=scale,
         groups=1 if E == 1 else 2, value_cols=_value_cols(qd, E, None))
     dpq, dpkk, dgc, dk2, dq2, db = kda_bwd_parallel(do, A, Mp, M, pq, pkk, gc, k2, q2, beta, W, Vd, dvd,
                                                      dgv, dk2v, dgo, dq2o, scale=scale)
     # decay over a whole chunk: state rows (e, d) scale by exp(g2_L,e) lam_d.  Its gradient pairs the state at the
-    # chunk start (h) with the gradient of the state at its end (ds), row by row.
-    trace = (h.float() * ds.float()).sum(-1)                                        # (B, NC, H, E, D)
+    # chunk start with the gradient of the state at its end, row by row: trace (B, NC, H, E, D) from the kernel.
     egl = gc.view(B, NC, C, H, E)[:, :, -1].exp()                                   # (B, NC, H, E)
     dlam = (egl[..., None] * trace).sum(3)                                          # (B, NC, H, D)
     dgc = dgc.view(B, NC, C, H, E).clone()

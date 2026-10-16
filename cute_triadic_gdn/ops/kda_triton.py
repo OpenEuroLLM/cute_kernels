@@ -53,55 +53,45 @@ def _prep_kernel(q, k, g, sign, qs_out, ks_out, qd_out, kd_out, ku_out, gd_out, 
 
 
 @triton.jit
-def _diag_block(left, right, gd, base, H, D: tl.constexpr, BS: tl.constexpr, BD: tl.constexpr,
-                STRICT: tl.constexpr):
-    """sum_d left_td right_sd e^(Gd_td - Gd_sd) for t, s in one 16-row block (s <= t, or s < t)."""
-    t = tl.arange(0, BS)
-    acc = tl.zeros((BS, BS), tl.float32)
-    for d0 in tl.static_range(0, D, BD):
-        dd = d0 + tl.arange(0, BD)
-        off = (base + t[:, None]) * H * D + dd[None, :]
-        lt = tl.load(left + off).to(tl.float32)
-        rt = tl.load(right + off).to(tl.float32)
-        gt = tl.load(gd + off)
-        ex = tl.exp(tl.minimum(gt[:, None, :] - gt[None, :, :], 0.0))
-        acc += tl.sum(lt[:, None, :] * rt[None, :, :] * ex, axis=2)
-    if STRICT:
-        keep = t[:, None] > t[None, :]
-    else:
-        keep = t[:, None] >= t[None, :]
-    return tl.where(keep, acc, 0.0)
-
-
-@triton.jit
 def _gram_fwd_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr, BS: tl.constexpr,
                      BD: tl.constexpr):
-    n, bh, blk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    """Rows of block X: off-diagonal blocks J < X by the factored exponentials (tf32 dots), the diagonal block by
+    pairwise exponentials (shared by both products), zeros above."""
+    n, bh, x = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     b, h = bh // H, bh % H
-    head = qs + h * D
-    keyh = ks + h * D
-    gdh = gd + h * D
-    row0 = b * T + n * C + blk * BS                    # token index of the block's first row
+    qh, kh, gh = qs + h * D, ks + h * D, gd + h * D
     t = tl.arange(0, BS)
+    rowx = b * T + n * C + x * BS
+    out_rows = ((rowx + t[:, None]) * H + h) * C
+    keep = t[:, None] >= t[None, :]
+    acc_q = tl.zeros((BS, BS), tl.float32)
+    acc_k = tl.zeros((BS, BS), tl.float32)
+    for d0 in tl.static_range(0, D, BD):
+        dd = d0 + tl.arange(0, BD)
+        offx = (rowx + t[:, None]) * H * D + dd[None, :]
+        gx = tl.load(gh + offx)
+        qx = tl.load(qh + offx).to(tl.float32)
+        kx = tl.load(kh + offx).to(tl.float32)
+        ex = tl.exp(tl.minimum(gx[:, None, :] - gx[None, :, :], 0.0))
+        acc_q += tl.sum(qx[:, None, :] * kx[None, :, :] * ex, axis=2)
+        acc_k += tl.sum(kx[:, None, :] * kx[None, :, :] * ex, axis=2)
+    cols = x * BS + t[None, :]
+    tl.store(pq + out_rows + cols, tl.where(keep, acc_q, 0.0))
+    tl.store(pkk + out_rows + cols, tl.where(t[:, None] > t[None, :], acc_k, 0.0))
     dd = tl.arange(0, D)
-    offi = (row0 + t[:, None]) * H * D + dd[None, :]
-    gr = tl.load(gdh + row0 * H * D + dd)              # Gd at the reference row
-    gi = tl.load(gdh + offi)
-    ei = tl.exp(gi - gr[None, :])
-    lq = (tl.load(head + offi).to(tl.float32) * ei)
-    lk = (tl.load(keyh + offi).to(tl.float32) * ei)
-    out_rows = ((row0 + t[:, None]) * H + h) * C
-    for j in tl.range(0, blk):
+    offx = (rowx + t[:, None]) * H * D + dd[None, :]
+    gr = tl.load(gh + rowx * H * D + dd)              # Gd at the reference row (first of X)
+    ei = tl.exp(tl.load(gh + offx) - gr[None, :])
+    lq = tl.load(qh + offx).to(tl.float32) * ei
+    lk = tl.load(kh + offx).to(tl.float32) * ei
+    for j in tl.range(0, x):
         rowj = b * T + n * C + j * BS
         offj = (rowj + t[:, None]) * H * D + dd[None, :]
-        rj = tl.load(keyh + offj).to(tl.float32) * tl.exp(gr[None, :] - tl.load(gdh + offj))
+        rj = tl.load(kh + offj).to(tl.float32) * tl.exp(gr[None, :] - tl.load(gh + offj))
         cols = j * BS + t[None, :]
-        tl.store(pq + out_rows + cols, tl.dot(lq, tl.trans(rj), input_precision="ieee"))
-        tl.store(pkk + out_rows + cols, tl.dot(lk, tl.trans(rj), input_precision="ieee"))
-    cols = blk * BS + t[None, :]
-    tl.store(pq + out_rows + cols, _diag_block(head, keyh, gdh, row0, H, D, BS, 32, False))
-    tl.store(pkk + out_rows + cols, _diag_block(keyh, keyh, gdh, row0, H, D, BS, 32, True))
-    for j in tl.range(blk + 1, C // BS):
+        tl.store(pq + out_rows + cols, tl.dot(lq, tl.trans(rj)))
+        tl.store(pkk + out_rows + cols, tl.dot(lk, tl.trans(rj)))
+    for j in tl.range(x + 1, C // BS):
         cols = j * BS + t[None, :]
         zero = tl.zeros((BS, BS), tl.float32)
         tl.store(pq + out_rows + cols, zero)
@@ -111,79 +101,56 @@ def _gram_fwd_kernel(qs, ks, gd, pkk, pq, T, H, D: tl.constexpr, C: tl.constexpr
 @triton.jit
 def _gram_bwd_kernel(qs, ks, gd, dpkk, dpq, dqs, dks, dgd, T, H, D: tl.constexpr, C: tl.constexpr,
                      BS: tl.constexpr, BD: tl.constexpr):
-    """Block X of rows: its row role (t in X; dqs, d(ks as the left key)) and column role (s in X; d(ks as the
-    right key)), then dGd = qs*dqs_q + ks*(dk_left - dk_right) by the shift identity of e^(Gd_t - Gd_s)."""
+    """Block X of rows, one BD-wide channel slice at a time: its row role (t in X; dqs, d(ks as the left key)) and
+    column role (s in X; d(ks as the right key)), then dGd = qs*dqs + ks*(dk_left - dk_right) by the shift identity
+    of e^(Gd_t - Gd_s)."""
     n, bh, x = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     b, h = bh // H, bh % H
     qh, kh, gh = qs + h * D, ks + h * D, gd + h * D
     t = tl.arange(0, BS)
-    dd = tl.arange(0, D)
     rowx = b * T + n * C + x * BS
-    offx = (rowx + t[:, None]) * H * D + dd[None, :]
-    gx = tl.load(gh + offx)
-    grx = tl.load(gh + rowx * H * D + dd)
-    dq = tl.zeros((BS, D), tl.float32)
-    dkl = tl.zeros((BS, D), tl.float32)
-    dkr = tl.zeros((BS, D), tl.float32)
-    # row role, off-diagonal: t in X, s in J < X, reference row = first row of X
-    for j in tl.range(0, x):
-        rowj = b * T + n * C + j * BS
-        offj = (rowj + t[:, None]) * H * D + dd[None, :]
-        rj = tl.load(kh + offj).to(tl.float32) * tl.exp(grx[None, :] - tl.load(gh + offj))
-        pidx = ((rowx + t[:, None]) * H + h) * C + j * BS + t[None, :]
-        dq += tl.dot(tl.load(dpq + pidx), rj, input_precision="ieee")
-        dkl += tl.dot(tl.load(dpkk + pidx), rj, input_precision="ieee")
-    ex = tl.exp(gx - grx[None, :])
-    dq = dq * ex
-    dkl = dkl * ex
-    # column role, off-diagonal: s in X, t in I > X, reference row = first row of I
-    for i in tl.range(x + 1, C // BS):
-        rowi = b * T + n * C + i * BS
-        offi = (rowi + t[:, None]) * H * D + dd[None, :]
-        gri = tl.load(gh + rowi * H * D + dd)
-        ei = tl.exp(tl.load(gh + offi) - gri[None, :])
-        li_q = tl.load(qh + offi).to(tl.float32) * ei
-        li_k = tl.load(kh + offi).to(tl.float32) * ei
-        pidx = ((rowi + t[:, None]) * H + h) * C + x * BS + t[None, :]          # [t in I, s in X]
-        part = tl.dot(tl.trans(tl.load(dpq + pidx)), li_q, input_precision="ieee")
-        part += tl.dot(tl.trans(tl.load(dpkk + pidx)), li_k, input_precision="ieee")
-        dkr += part * tl.exp(gri[None, :] - gx)
-    # diagonal block: pairwise exponentials, in BD-wide channel slices
-    pidx = ((rowx + t[:, None]) * H + h) * C + x * BS + t[None, :]
-    pq_d = tl.load(dpq + pidx)
-    pk_d = tl.load(dpkk + pidx)
-    keep = t[:, None] >= t[None, :]
-    pq_d = tl.where(keep, pq_d, 0.0)
-    pk_d = tl.where(t[:, None] > t[None, :], pk_d, 0.0)
+    pdiag = ((rowx + t[:, None]) * H + h) * C + x * BS + t[None, :]
+    pq_d = tl.where(t[:, None] >= t[None, :], tl.load(dpq + pdiag), 0.0)
+    pk_d = tl.where(t[:, None] > t[None, :], tl.load(dpkk + pdiag), 0.0)
     for d0 in tl.static_range(0, D, BD):
-        dc = d0 + tl.arange(0, BD)
-        offc = (rowx + t[:, None]) * H * D + dc[None, :]
-        qc = tl.load(qh + offc).to(tl.float32)
-        kc = tl.load(kh + offc).to(tl.float32)
-        gc = tl.load(gh + offc)
-        e3 = tl.exp(tl.minimum(gc[:, None, :] - gc[None, :, :], 0.0))      # [t, s, d]
-        dq_c = tl.sum(pq_d[:, :, None] * kc[None, :, :] * e3, axis=1)     # row role: sum over s
-        dkl_c = tl.sum(pk_d[:, :, None] * kc[None, :, :] * e3, axis=1)
-        dkr_c = tl.sum(pq_d[:, :, None] * qc[:, None, :] * e3 + pk_d[:, :, None] * kc[:, None, :] * e3, axis=0)
-        # place the slice into the full-width accumulators
-        sel = (dd[None, :] >= d0) & (dd[None, :] < d0 + BD)
-        dq += tl.where(sel, _widen(dq_c, d0, BS, BD, D), 0.0)
-        dkl += tl.where(sel, _widen(dkl_c, d0, BS, BD, D), 0.0)
-        dkr += tl.where(sel, _widen(dkr_c, d0, BS, BD, D), 0.0)
-    qx = tl.load(qh + offx).to(tl.float32)
-    kx = tl.load(kh + offx).to(tl.float32)
-    tl.store(dqs + h * D + offx, dq)
-    tl.store(dks + h * D + offx, dkl + dkr)
-    tl.store(dgd + h * D + offx, qx * dq + kx * (dkl - dkr))
-
-
-@triton.jit
-def _widen(x, d0, BS: tl.constexpr, BD: tl.constexpr, D: tl.constexpr):
-    """[BS, BD] -> [BS, D] with x in columns d0..d0+BD (zeros elsewhere), via a one-hot product."""
-    src = tl.arange(0, BD)
-    dst = tl.arange(0, D)
-    onehot = (dst[None, :] == (src[:, None] + d0)).to(tl.float32)
-    return tl.dot(x, onehot, input_precision="ieee")
+        dd = d0 + tl.arange(0, BD)
+        offx = (rowx + t[:, None]) * H * D + dd[None, :]
+        gx = tl.load(gh + offx)
+        grx = tl.load(gh + rowx * H * D + dd)
+        qx = tl.load(qh + offx).to(tl.float32)
+        kx = tl.load(kh + offx).to(tl.float32)
+        dq = tl.zeros((BS, BD), tl.float32)
+        dkl = tl.zeros((BS, BD), tl.float32)
+        dkr = tl.zeros((BS, BD), tl.float32)
+        # row role, off-diagonal: s in J < X, reference row = first row of X
+        for j in tl.range(0, x):
+            rowj = b * T + n * C + j * BS
+            offj = (rowj + t[:, None]) * H * D + dd[None, :]
+            rj = tl.load(kh + offj).to(tl.float32) * tl.exp(grx[None, :] - tl.load(gh + offj))
+            pidx = ((rowx + t[:, None]) * H + h) * C + j * BS + t[None, :]
+            dq += tl.dot(tl.load(dpq + pidx), rj)
+            dkl += tl.dot(tl.load(dpkk + pidx), rj)
+        ex = tl.exp(gx - grx[None, :])
+        dq = dq * ex
+        dkl = dkl * ex
+        # column role, off-diagonal: t in I > X, reference row = first row of I
+        for i in tl.range(x + 1, C // BS):
+            rowi = b * T + n * C + i * BS
+            offi = (rowi + t[:, None]) * H * D + dd[None, :]
+            gri = tl.load(gh + rowi * H * D + dd)
+            ei = tl.exp(tl.load(gh + offi) - gri[None, :])
+            pidx = ((rowi + t[:, None]) * H + h) * C + x * BS + t[None, :]          # [t in I, s in X]
+            part = tl.dot(tl.trans(tl.load(dpq + pidx)), tl.load(qh + offi).to(tl.float32) * ei)
+            part += tl.dot(tl.trans(tl.load(dpkk + pidx)), tl.load(kh + offi).to(tl.float32) * ei)
+            dkr += part * tl.exp(gri[None, :] - gx)
+        # diagonal block: pairwise exponentials
+        e3 = tl.exp(tl.minimum(gx[:, None, :] - gx[None, :, :], 0.0))              # [t, s, d]
+        dq += tl.sum(pq_d[:, :, None] * kx[None, :, :] * e3, axis=1)
+        dkl += tl.sum(pk_d[:, :, None] * kx[None, :, :] * e3, axis=1)
+        dkr += tl.sum((pq_d[:, :, None] * qx[:, None, :] + pk_d[:, :, None] * kx[:, None, :]) * e3, axis=0)
+        tl.store(dqs + h * D + offx, dq)
+        tl.store(dks + h * D + offx, dkl + dkr)
+        tl.store(dgd + h * D + offx, qx * dq + kx * (dkl - dkr))
 
 
 @triton.jit
@@ -252,7 +219,7 @@ def gram_fwd(qs, ks, gd):
     B, T, H, D = qs.shape
     pkk = torch.empty(B, T, H, C, device=qs.device, dtype=torch.float32)
     pq = torch.empty_like(pkk)
-    _gram_fwd_kernel[(T // C, B * H, C // BS)](qs, ks, gd, pkk, pq, T, H, D, C, BS, 32, num_warps=4)
+    _gram_fwd_kernel[(T // C, B * H, C // BS)](qs, ks, gd, pkk, pq, T, H, D, C, BS, 32, num_warps=8)
     return pkk, pq
 
 
@@ -262,5 +229,5 @@ def gram_bwd(qs, ks, gd, dpkk, dpq):
     dqs = torch.empty(B, T, H, D, device=qs.device, dtype=torch.float32)
     dks, dgd = torch.empty_like(dqs), torch.empty_like(dqs)
     _gram_bwd_kernel[(T // C, B * H, C // BS)](qs, ks, gd, dpkk.contiguous(), dpq.contiguous(), dqs, dks, dgd,
-                                               T, H, D, C, BS, 16, num_warps=4)
+                                               T, H, D, C, BS, 32, num_warps=4)
     return dqs, dks, dgd
