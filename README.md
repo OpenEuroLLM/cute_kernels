@@ -48,6 +48,27 @@ depthwise convolution (width 4, SiLU on the first `act_channels` channels) that 
 v, k2 and q2 in one pass. `GJ_SAVE_MASKS=0` makes the backward recompute the chunk masks instead of storing them.
 The numbers stay the same and every layer needs 768 MiB less at 128k tokens.
 
+## Triadic KDA / Complex KDA (Hopper)
+
+```python
+from cute_triadic_gdn.ops.kda_joint import chunk_kda_joint
+
+o = chunk_kda_joint(q, k, v, k2, q2, g2, g, beta, sign=None, scale=None)
+```
+
+KDA's per-channel decay inside every slice: state row `(e, d)` decays by `sign_{t,d} exp(g2_{t,e} + g_{t,d})`, with
+`g` `(B, T, H, 128)` f32 the channel log-decay (`<= 0`), `sign` `(B, T, H, 128)` int8 in `{-1, +1}` or `None`
+(Complex KDA / KDA), and `beta` up to 2 for Complex KDA. `E` in 1, 2, 4, 8; `T % 64 == 0`; no packed documents yet.
+
+The decay is separable, so the chunkwise form factorises into the slice part the GDN kernels already form (the
+masks R, R') and a channel part that only involves q, k and g. Triton kernels (`ops/kda_triton.py`) form the
+channel-decayed operands per chunk (decayed reads `q e^G`, `k e^G`, the update key `k e^(G_L - G)`, the per-channel
+chunk decay and the decayed key-key / query-key products, every exponential bounded by 1 through 16-row blocks);
+the CuTe kernels (`kernels/sm90_kda_*.py`, variants of the GDN ones) run the recurrence on them, and the backward
+returns their gradients untied, which the Triton kernels chain back to q, k and g. `backend="torch"` runs the same
+pipeline with the CuTe stages in torch (the test oracle); `ops/kda_reference.py` has the token recurrence.
+`pytest tests/test_kda_joint.py`.
+
 ## Tests
 
 `python tests/test_joint.py` (or `pytest tests`) checks the kernels against the torch reference on one GPU, for
