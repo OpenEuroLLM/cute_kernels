@@ -293,11 +293,12 @@ _LOG2E = 1.4426950408889634
 
 
 def _fla_intra_bwd():
-    """flash-linear-attention's KDA intra-chunk backward, or None (not installed / disabled with
-    CUTE_KDA_GRAM_BWD=triton)."""
+    """flash-linear-attention's KDA intra-chunk backward with CUTE_KDA_GRAM_BWD=fla, else None
+    (the default: the Triton kernel below is 1.6x faster at the speed suite's shape on H100,
+    1.41 vs 2.20 ms, bench_gram.py)."""
     import os
 
-    if os.environ.get("CUTE_KDA_GRAM_BWD", "fla") != "fla":
+    if os.environ.get("CUTE_KDA_GRAM_BWD", "triton") != "fla":
         return None
     try:
         from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
@@ -309,11 +310,11 @@ def _fla_intra_bwd():
 def gram_bwd(qs, ks, gd, dpkk, dpq):
     """(dqs, dks, dGd) fp32 (B, T, H, D) from the gradients of Pkk and Pq (B, T, H, 64) fp32.
 
-    The products are those of KDA's intra-chunk attention (beta = 1, scale = 1), so by default
-    flash-linear-attention's tuned intra-chunk backward computes them. It takes the gate in base 2
+    The products are those of KDA's intra-chunk attention (beta = 1, scale = 1), so
+    flash-linear-attention's intra-chunk backward can compute them (CUTE_KDA_GRAM_BWD=fla). It takes the gate in base 2
     (times log2(e)) but returns the gate gradient for the natural-log gate, and it reads the whole
     row of dAqk / dAkk, so the entries outside the products' triangles are zeroed first. The Triton kernel below
-    is the fallback (CUTE_KDA_GRAM_BWD=triton)."""
+    is the default (CUTE_KDA_GRAM_BWD=fla selects FLA's)."""
     fla_bwd = _fla_intra_bwd()
     if fla_bwd is not None:
         B, T, H, D = qs.shape

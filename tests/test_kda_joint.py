@@ -76,10 +76,11 @@ def test_cute_against_torch_pipeline(B, T, H, E, signed, gate_scale):
 
 @pytest.mark.skipif(not _hopper(), reason="needs sm90")
 @pytest.mark.parametrize("gate_scale", [0.5, 4.0])
-def test_gram_bwd_fla_matches_triton(gate_scale):
+def test_gram_bwd_fla_matches_triton(gate_scale, monkeypatch):
     """flash-linear-attention's intra-chunk backward == the Triton Gram backward."""
     from cute_triadic_gdn.ops import kda_triton as kt
 
+    monkeypatch.setenv("CUTE_KDA_GRAM_BWD", "fla")
     if kt._fla_intra_bwd() is None:
         pytest.skip("flash-linear-attention not importable")
     torch.manual_seed(0)
