@@ -1,3 +1,12 @@
+# cute_kernels
+
+OpenEuroLLM's CuTe DSL and TileLang kernels for the hybrid-architecture work. It starts
+from [cute-triadic-gdn](https://github.com/OliverSieberling/cute-triadic-gdn) (MIT, history
+kept), extended with Triadic KDA / Complex KDA (below); further kernels are added as
+their own packages next to `cute_triadic_gdn`.
+
+---
+
 # cute-triadic-gdn
 
 CuTe DSL kernels for Triadic Gated DeltaNet, the main model of
