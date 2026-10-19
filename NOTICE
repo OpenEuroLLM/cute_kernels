@@ -6,3 +6,7 @@ The chunkwise schedule of the Triadic GDN kernels follows the Hopper kernels of 
 cute_triadic_gdn/ops/conv_split_act.py adapts the causal short-convolution Triton kernels of
 flash-linear-attention (https://github.com/fla-org/flash-linear-attention,
 Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li, MIT License).
+
+cute_ldm/kernels/, cute_ldm/schedules.py, cute_ldm/tuned/ and the launch helpers in
+cute_ldm/workspace.py are vendored from Depth Memory (https://github.com/davidgonmar/depth-memory,
+Copyright (c) 2026 David Gonzalez Martinez, MIT License; see cute_ldm/LICENSE_DEPTH_MEMORY).
