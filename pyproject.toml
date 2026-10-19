@@ -14,7 +14,8 @@ dependencies = [
     "nvidia-cutlass-dsl==4.7.1",
     "cuda-python",
     "triton",
+    "tilelang>=0.1.15",
 ]
 
 [tool.setuptools.packages.find]
-include = ["cute_triadic_gdn*"]
+include = ["cute_triadic_gdn*", "tile_kernels*", "oellm_mhc*"]

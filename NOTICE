@@ -6,3 +6,7 @@ The chunkwise schedule of the Triadic GDN kernels follows the Hopper kernels of 
 cute_triadic_gdn/ops/conv_split_act.py adapts the causal short-convolution Triton kernels of
 flash-linear-attention (https://github.com/fla-org/flash-linear-attention,
 Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li, MIT License).
+
+tile_kernels/ is DeepSeek's TileKernels (https://github.com/deepseek-ai/TileKernels, commit c1cf914,
+Copyright (c) 2026 DeepSeek, MIT License; see tile_kernels/LICENSE), vendored unchanged, with its mHC
+and Engram tests in tests/tile_kernels/. oellm_mhc/ wraps its mHC read / write kernels for Megatron.
