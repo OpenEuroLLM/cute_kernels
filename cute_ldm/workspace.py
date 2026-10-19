@@ -87,9 +87,24 @@ def _run(kernel, sizes, tensors, metadata, edge, options, schedule):
     from cutlass.cute.runtime import from_dlpack
 
     # Views can keep requires_grad inside Function.forward, so detach what we hand to the kernel.
-    # The autograd graph itself is untouched.
-    arguments = [None if tensor is None else from_dlpack(tensor.detach(), assumed_align=item[3])
-                 for tensor, item in zip(tensors, metadata, strict=True)]
+    # The autograd graph itself is untouched. (cute_ldm: views of the static workspace buffers are
+    # converted once and cached -- the same memory every micro-batch; per-call tensors each time.)
+    arguments = []
+    for tensor, item in zip(tensors, metadata, strict=True):
+        if tensor is None:
+            arguments.append(None)
+            continue
+        key = None
+        if tensor.untyped_storage().data_ptr() in _STATIC_STORAGES:
+            key = (tensor.data_ptr(), item[1], item[2], item[3], item[0])
+            cached = _STATIC_ARGS.get(key)
+            if cached is not None:
+                arguments.append(cached)
+                continue
+        converted = from_dlpack(tensor.detach(), assumed_align=item[3])
+        if key is not None:
+            _STATIC_ARGS[key] = converted
+        arguments.append(converted)
     if edge is not None:
         arguments.append(cutlass.Int32(edge))
     arguments.append(cuda.CUstream(torch.cuda.current_stream().cuda_stream))
@@ -115,6 +130,9 @@ def _launch(kernel: str, sizes: tuple[int, ...], tensors: list[torch.Tensor | No
 
 
 _launch_state = {"misses": 0}
+# storages of the live workspaces' buffers, and their launch arguments (see _run)
+_STATIC_STORAGES = set()
+_STATIC_ARGS = {}
 
 # The dtypes the forward may keep the running covariance in.
 RUNNING_COVARIANCE_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -177,6 +195,13 @@ class CuteDepthMemoryWorkspace:
         self.future_value_grad = empty((span, n, g, d))
         self.dy, self.dv = [empty((span, n, g, d), torch.bfloat16) for _ in range(2)]
         self.future_gain_grad = empty((span, n, g, k))
+        # the launch-argument cache of these buffers (their addresses are fixed from here on);
+        # a reallocation drops the previous buffers' entries first
+        _STATIC_ARGS.clear()
+        _STATIC_STORAGES.difference_update(getattr(self, "_storages", ()))
+        self._storages = {value.untyped_storage().data_ptr() for value in vars(self).values()
+                          if isinstance(value, torch.Tensor)}
+        _STATIC_STORAGES.update(self._storages)
 
     def _padded(self, rows):
         padding = self.padded_value_dim - self.value_dim
