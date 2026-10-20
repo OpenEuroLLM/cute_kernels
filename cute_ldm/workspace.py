@@ -169,6 +169,8 @@ class CuteDepthMemoryWorkspace:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("cute_ldm: workspace allocation inside a CUDA graph capture")
         self.n, self.device = n, torch.device(device)
+        self.state_loaded = False  # load_state: this segment starts from a carried state
+        self.grad_loaded = False  # load_grad: the backward starts from a carried state gradient
         g, k, d, length, span = self.groups, self.key_dim, self.padded_value_dim, \
             self.total_edges, self.span
 
@@ -218,9 +220,10 @@ class CuteDepthMemoryWorkspace:
     @torch.no_grad()
     def forward(self, edge, khat, query, value, scale, forgetting) -> torch.Tensor:
         n, g, k = self.n, self.groups, self.key_dim
-        if edge == 0:
+        if edge == 0 and not self.state_loaded:
             self.p.copy_(self.p0)
         start, end = self._window(edge)
+        zero_start = start == 0 and not self.state_loaded
         raw_key = _aligned(khat.float().reshape(n, g, k))
         query = _aligned(query.float().reshape(n, g, k))
         scale = _aligned(scale.float().reshape(n, g))
@@ -231,7 +234,7 @@ class CuteDepthMemoryWorkspace:
         read = torch.empty_like(value)
         tapes = [self.keys[edge], self.queries[edge], self.scales[edge], self.forgetting_tape[edge]]
         sizes = (end - start, n, g, k, self.padded_value_dim)
-        options = (("first_window", start == 0),
+        options = (("first_window", zero_start),
                    ("running_covariance_dtype", self.running_covariance_dtype))
         _launch("forward", sizes,
                 [self.m, self.p, raw_key, query, value, scale, forgetting, self.gains[start:end],
@@ -243,10 +246,11 @@ class CuteDepthMemoryWorkspace:
     # -- backward ------------------------------------------------------------------------------
     @torch.no_grad()
     def backward(self, edge, read_grad):
-        if edge == self.total_edges - 1:
+        if edge == self.total_edges - 1 and not self.grad_loaded:
             self.dm.zero_()
             self.covariance_grad.zero_()
         start, end = self._window(edge)
+        zero_start = start == 0 and not self.state_loaded
         count = end - start
         saved = self.saved_covariance_tape[start:end]
         n, g, k, d = self.n, self.groups, self.key_dim, self.padded_value_dim
@@ -275,7 +279,7 @@ class CuteDepthMemoryWorkspace:
                      self.scales[edge], self.dy[:count], self.dv[:count], query_output,
                      self.covariance_grad, forgetting_output,
                      raw_value_grad, raw_key_grad, scale_grad, saved],
-                    options=(("first_window", start == 0),), training=True)
+                    options=(("first_window", zero_start),), training=True)
         else:
             _launch("interior", (count, n, g, k, d),
                     [self.m, self.residuals[start:end], self.dy[:count], self.keys[start:end],
@@ -287,3 +291,42 @@ class CuteDepthMemoryWorkspace:
                      scale_grad, saved, current_dy], edge - start, training=True)
         return (raw_key_grad, query_grad, self._unpadded(raw_value_grad), scale_grad,
                 forgetting_grad.sum(0))
+
+    # -- segments (a state carried across recompute chunks / pipeline stages) ------------------
+    # A segment is the edges of one recompute chunk or stage: its workspace (``total_edges`` = the
+    # segment's edges, windows from its first edge) starts from the previous segment's state, and
+    # its backward from the next segment's state gradient. M is committed at every window end, so
+    # the state at a window boundary is complete. The backward is not: a window's own read /
+    # residual terms of dL/dM_start are added by the PREVIOUS window's window-end launch (its
+    # "future" tapes), so at a segment start they are folded into dM here (export_grad) and the
+    # previous segment's last window runs with no future, from the carried dM.
+    def load_state(self, m: torch.Tensor, p: torch.Tensor) -> None:
+        """Start the next forward from M ``[n, G, K, D]`` (bf16) and the packed running P."""
+        self.m.copy_(m.view_as(self.m))
+        self.p.copy_(p.view_as(self.p))
+        self.state_loaded = True
+
+    def export_state(self):
+        """(M, P) after the forward's last edge (views of the workspace: copy before reuse)."""
+        return self.m, self.p
+
+    def load_grad(self, dm: torch.Tensor, covariance_grad: torch.Tensor) -> None:
+        """Start the next backward from dL/dM and dL/dP (packed, fp32) at the segment's end."""
+        self.dm.copy_(dm.view_as(self.dm))
+        self.covariance_grad.copy_(covariance_grad.view_as(self.covariance_grad))
+        self.grad_loaded = True
+
+    @torch.no_grad()
+    def export_grad(self):
+        """dL/dM and dL/dP at the segment's start, after the backward of its first edge: dM with the
+        first window's own terms folded in, sum_e q_e dy_e^T - kbar_e dv_e^T over its edges (what
+        the previous window's window-end would add from its future tapes)."""
+        count = min(self.span, self.total_edges)
+        dy = self.dy[:count].float()  # [E, n, g, d] the window's read gradients
+        dv = self.dv[:count].float()  # [E, n, g, d] its pseudo-value gradients
+        q = self.queries[:count]  # [E, n, g, k]
+        kbar = self.keys[:count]
+        fold = torch.einsum("engk,engd->ngkd", q, dy) - torch.einsum("engk,engd->ngkd", kbar, dv)
+        dm = self.dm.float() + fold
+        return dm, self.covariance_grad
+
