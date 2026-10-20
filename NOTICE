@@ -10,3 +10,7 @@ Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li, MIT License).
 tile_kernels/ is DeepSeek's TileKernels (https://github.com/deepseek-ai/TileKernels, commit c1cf914,
 Copyright (c) 2026 DeepSeek, MIT License; see tile_kernels/LICENSE), vendored unchanged, with its mHC
 and Engram tests in tests/tile_kernels/. oellm_mhc/ wraps its mHC read / write kernels for Megatron.
+
+cute_ldm/kernels/, cute_ldm/schedules.py, cute_ldm/tuned/ and the launch helpers in
+cute_ldm/workspace.py are vendored from Depth Memory (https://github.com/davidgonmar/depth-memory,
+Copyright (c) 2026 David Gonzalez Martinez, MIT License; see cute_ldm/LICENSE_DEPTH_MEMORY).

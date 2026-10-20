@@ -18,4 +18,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["cute_triadic_gdn*", "tile_kernels*", "oellm_mhc*"]
+include = ["cute_triadic_gdn*", "tile_kernels*", "oellm_mhc*", "cute_ldm*"]
+
+[tool.setuptools.package-data]
+cute_ldm = ["tuned/*.json", "LICENSE_DEPTH_MEMORY"]
