@@ -317,10 +317,12 @@ class CuteDepthMemoryWorkspace:
         self.grad_loaded = True
 
     @torch.no_grad()
-    def export_grad(self):
+    def export_grad(self, fold: bool = True):
         """dL/dM and dL/dP at the segment's start, after the backward of its first edge: dM with the
         first window's own terms folded in, sum_e q_e dy_e^T - kbar_e dv_e^T over its edges (what
         the previous window's window-end would add from its future tapes)."""
+        if not fold:  # (tests: the fold is needed)
+            return self.dm.float(), self.covariance_grad
         count = min(self.span, self.total_edges)
         dy = self.dy[:count].float()  # [E, n, g, d] the window's read gradients
         dv = self.dv[:count].float()  # [E, n, g, d] its pseudo-value gradients
