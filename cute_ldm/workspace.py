@@ -332,6 +332,10 @@ class CuteDepthMemoryWorkspace:
         dm = self.dm.float() + fold
         return dm, self.covariance_grad
 
+    def grad_buffers(self):
+        """The buffers the backward starts from (load_grad's targets): dM bf16, dP fp32."""
+        return self.dm, self.covariance_grad
+
     def state_layout(self):
         """(per-token shape, dtype) of the carried state (M, P as the workspace keeps them) and of
         its gradient (dM bf16 as the backward keeps it, dP the fp32 packed triangle)."""
