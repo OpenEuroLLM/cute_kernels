@@ -332,3 +332,14 @@ class CuteDepthMemoryWorkspace:
         dm = self.dm.float() + fold
         return dm, self.covariance_grad
 
+    def state_layout(self):
+        """(per-token shape, dtype) of the carried state (M, P as the workspace keeps them) and of
+        its gradient (dM bf16 as the backward keeps it, dP the fp32 packed triangle)."""
+        g, k, d = self.groups, self.key_dim, self.padded_value_dim
+        dtype = RUNNING_COVARIANCE_DTYPES[self.running_covariance_dtype]
+        per16 = 16 // dtype.itemsize
+        tri = k * (k + 1) // 2
+        state = [((g, k, d), torch.bfloat16), ((g, -(-tri // per16) * per16), dtype)]
+        grad = [((g, k, d), torch.bfloat16), ((g, tri), torch.float32)]
+        return state, grad
+
