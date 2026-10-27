@@ -15,7 +15,7 @@ vi, the value gradient, is summed in FP32 per lane; dv and the raw value gradien
 it. The contractions take vi as the exact sum of its three BF16 parts and accumulate in FP32 on
 the tensor cores.
 
-P from before this edge's update comes from the saved covariance tape. ``current_dy``, this edge's
+P from before this edge's update comes from the window end's FP32 scratch (p_scratch). ``current_dy``, this edge's
 read gradient, is staged into the pool and written once into the edge's slot of the DY history.
 """
 
@@ -103,8 +103,7 @@ class Interior:
         self.n_tiles = (self.b_rows + 7) // 8
         self.dense_rows = max(self.m_tiles * 16, self.b_row + self.n_tiles * 8, self.a_rows)
         self.packed_words = K * (K + 1) // 2
-        self.p_off = self.dense_rows * self.row_stride
-        self.dense_elems = self.p_off + (self.packed_words + 7) // 8 * 8
+        self.dense_elems = self.dense_rows * self.row_stride
         # FP32 words per stage; every 16-byte copy lands on a 16-byte boundary.
         self.future_value_grad_off = 0
         self.c_off = (D + 3) // 4 * 4
@@ -116,7 +115,8 @@ class Interior:
         self.lam_off = self.future_gain_grad_off + K
         self.den_off = (self.lam_off + E + 3) // 4 * 4
         self.scale_off = self.den_off + 1
-        self.compact_words = (self.scale_off + 1 + 3) // 4 * 4
+        self.p_off = (self.scale_off + 1 + 3) // 4 * 4          # this edge's pre-write P, FP32
+        self.compact_words = (self.p_off + self.packed_words + 3) // 4 * 4
         self.stage_bytes = 2 * self.dense_elems + 4 * self.compact_words
         # Copy classes (16-byte chunks, 32 per instruction); see prepare_issue.
         per_row = max(D // 8, 1)
@@ -126,8 +126,8 @@ class Interior:
         self.c_copy_bytes = math.gcd(16, 4 * self.c_words)
         self.c_chunks = 4 * self.c_words // self.c_copy_bytes
         self.c_parts = (self.c_chunks + 31) // 32
-        self.p_copy_bytes = math.gcd(16, 2 * self.packed_words)
-        self.p_chunks = 2 * self.packed_words // self.p_copy_bytes
+        self.p_copy_bytes = math.gcd(16, 4 * self.packed_words)
+        self.p_chunks = 4 * self.packed_words // self.p_copy_bytes
         self.p_parts = (self.p_chunks + 31) // 32
         self.k_vector_rows = 1 + 3 * E
         self.k_parts = (self.k_vector_rows * (K // 4) + 31) // 32
@@ -136,15 +136,15 @@ class Interior:
                              + self.p_parts + self.k_parts + self.s_parts)
         # The covariance VJP and the outputs after it keep K lanes busy per group, so they run
         # for 32 // K groups at once. Each group waits for its pack in a per-warp finish slot:
-        # FP32 words [C | key | gain | forgetting, denominator, scale, r_i.vi] and BF16 P.
+        # FP32 words [C | key | gain | forgetting, denominator, scale, r_i.vi] and FP32 P.
         self.pack = 32 // K
         self.slot_c = 0
         self.slot_key = (self.packed_words + 3) // 4 * 4
         self.slot_gain = self.slot_key + K
         self.slot_scalars = self.slot_gain + K
         self.slot_words = self.slot_scalars + 4
-        self.slot_p = (self.packed_words + 7) // 8 * 8
-        self.slot_bytes = self.pack * (4 * self.slot_words + 2 * self.slot_p)
+        self.slot_p = (self.packed_words + 3) // 4 * 4
+        self.slot_bytes = self.pack * (4 * self.slot_words + 4 * self.slot_p)
         self.shared_bytes = self.warps * (self.stages * self.stage_bytes + self.slot_bytes) + 128
 
     @cute.jit
@@ -213,9 +213,9 @@ class Interior:
             c += 1
         for part in cutlass.range_constexpr(self.p_parts):
             chunk = part * 32 + lane
-            gaddr[c] = saved_p.iterator.toint() + current * (2 * self.packed_words) + chunk * self.p_copy_bytes
-            gdelta[c] = step * (2 * self.packed_words)
-            soff[c] = 2 * self.p_off + chunk * self.p_copy_bytes
+            gaddr[c] = saved_p.iterator.toint() + current * (4 * self.packed_words) + chunk * self.p_copy_bytes
+            gdelta[c] = step * (4 * self.packed_words)
+            soff[c] = 4 * self.p_off + chunk * self.p_copy_bytes
             c += 1
         kchunks: cutlass.Constexpr = K // 4
         for part in cutlass.range_constexpr(self.k_parts):
@@ -304,11 +304,11 @@ class Interior:
         for part in cutlass.range_constexpr(self.p_parts):
             if part * 32 + lane < self.p_chunks:
                 if cutlass.const_expr(self.p_copy_bytes == 16):
-                    _cp_async_16(dense_addr + soff[c], gaddr[c])
+                    _cp_async_16(compact_addr + soff[c], gaddr[c])
                 elif cutlass.const_expr(self.p_copy_bytes == 8):
-                    _cp_async_8(dense_addr + soff[c], gaddr[c])
+                    _cp_async_8(compact_addr + soff[c], gaddr[c])
                 else:
-                    _cp_async_4(dense_addr + soff[c], gaddr[c])
+                    _cp_async_4(compact_addr + soff[c], gaddr[c])
             gaddr[c] = gaddr[c] + gdelta[c]
             c += 1
         kchunks: cutlass.Constexpr = K // 4
@@ -350,7 +350,7 @@ class Interior:
             (dv, (self.E, self.N, self.G, self.D), BFloat16),
             (forgetting_tape, (self.E, self.N, self.G), Float32),
             (denominators, (self.E, self.N, self.G), Float32),
-            (saved_p, (self.E, self.N, self.G, words), BFloat16),
+            (saved_p, (self.E, self.N, self.G, words), Float32),
             (covariance_grad, (self.N, self.G, words), Float32),
         ):
             assert tensor.element_type == dtype
@@ -642,7 +642,7 @@ class Interior:
             index = part * 32 + lane
             if index < words:
                 slots[sw + self.slot_c + index] = compact[coff + self.c_off + index]
-                slot_p[sp + index] = dense[doff + self.p_off + index]
+                slot_p[sp + index] = compact[coff + self.p_off + index]
         if lane < K:
             slots[sw + self.slot_key + lane] = compact[coff + self.keys_off + edge * K + lane]
             slots[sw + self.slot_gain + lane] = compact[go + edge * K + lane]
@@ -749,7 +749,7 @@ class Interior:
             self.warps * self.stages * self.compact_words), byte_alignment=16)
         slots = smem.allocate_tensor(Float32, cute.make_layout(
             self.warps * self.pack * self.slot_words), byte_alignment=16)
-        slot_p = smem.allocate_tensor(BFloat16, cute.make_layout(
+        slot_p = smem.allocate_tensor(Float32, cute.make_layout(
             self.warps * self.pack * self.slot_p), byte_alignment=16)
         S: cutlass.Constexpr = self.stages
         dense_base = warp * (S * self.dense_elems)
@@ -764,7 +764,7 @@ class Interior:
         for part in cutlass.range_constexpr(cute.ceil_div(self.pack * self.slot_p, 32)):
             index = part * 32 + lane
             if index < self.pack * self.slot_p:
-                slot_p[slot_p_base + index] = BFloat16(0.0)
+                slot_p[slot_p_base + index] = Float32(0.0)
         # The padding columns D..d_pad of every panel row are zero and no copy or store writes
         # them.
         if cutlass.const_expr(self.d_pad > D):

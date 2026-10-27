@@ -5,8 +5,8 @@
 A producer warp copies batches of consecutive groups into two shared stages with bulk copies
 (full and empty mbarriers). Consumer warps update the packed covariance, form the residual
 against the window's start state and the window's earlier residuals, read, and at the window's
-last edge commit the window's residuals into M. ``saved`` receives the packed BF16 covariance of
-every edge from before its update (rows of K(K+1)/2 entries).
+last edge commit the window's residuals into M. The backward unwinds the covariance from the
+running P, so the forward saves no copy of it.
 
 The kernel takes the raw per-edge inputs: each consumer warp forms its groups' keys as
 raw_key * scale (one FP32 product) in the staged copy and writes the key, query, scale and
@@ -16,7 +16,7 @@ from global memory instead of being staged.
 The arithmetic is FP32 with a fixed summation order over the K lanes and a fixed column update
 order. Residuals are rounded to BF16 before they are reused; the reads and the committed M
 are stored in BF16. The running covariance (16-byte padded rows) is stored in BF16 or, with
-``running_covariance_dtype="float32"``, in FP32; the saved covariance is BF16 either way.
+``running_covariance_dtype="float32"``, in FP32.
 """
 
 import math
@@ -122,7 +122,7 @@ class Forward:
         rawkey: cute.Tensor, query: cute.Tensor, rawvalue: cute.Tensor,
         write_scale: cute.Tensor, forgetting: cute.Tensor,
         gain_tape: cute.Tensor, residual_tape: cute.Tensor,
-        denominator_tape: cute.Tensor, read_out: cute.Tensor, saved,
+        denominator_tape: cute.Tensor, read_out: cute.Tensor,
         key_tape: cute.Tensor, query_tape: cute.Tensor, scale_tape: cute.Tensor,
         forgetting_tape: cute.Tensor, edge: Int32, stream: cuda.CUstream,
     ):
@@ -137,7 +137,6 @@ class Forward:
             (residual_tape, self.residual_tape_shape, BFloat16),
             (denominator_tape, self.denominator_tape_shape, Float32),
             (read_out, (self.N, self.G, self.D), BFloat16),
-            (saved, (self.E, self.N, self.G, packed_size(self.K)), BFloat16),
             (key_tape, (self.N, self.G, self.K), Float32),
             (query_tape, (self.N, self.G, self.K), Float32),
             (scale_tape, (self.N, self.G), Float32),
@@ -156,7 +155,7 @@ class Forward:
         assert forgetting.stride[0] in (self.G, 0)
         self.kernel(
             m, covariance, rawkey, query, rawvalue, write_scale, forgetting,
-            gain_tape, residual_tape, denominator_tape, read_out, saved,
+            gain_tape, residual_tape, denominator_tape, read_out,
             key_tape, query_tape, scale_tape, forgetting_tape, edge,
         ).launch(grid=(self.blocks, 1, 1), block=(32 * self.warps, 1, 1),
                  smem=self.shared_bytes, stream=stream)
@@ -288,8 +287,7 @@ class Forward:
                      doff, coff, lane, width: cutlass.Constexpr, edge: Int32,
                      commit: cutlass.Constexpr, m: cute.Tensor, covariance: cute.Tensor,
                      gain_tape: cute.Tensor, residual_tape: cute.Tensor,
-                     denominator_tape: cute.Tensor, read_out: cute.Tensor,
-                     saved: cute.Tensor):
+                     denominator_tape: cute.Tensor, read_out: cute.Tensor):
         """This warp's groups [base, base + per_warp) of the stage. The K-lane phase computes
         ``pack`` groups per pass with lane = (group, k); the D phase gives every lane ``width``
         columns and covers ``dense_groups`` groups per pass."""
@@ -341,10 +339,7 @@ class Forward:
                 pk[k] = cute.arch.shuffle_sync(pk_lane, sub * K + k)
             group = g0 + gi
             n, g = group // self.G, group % self.G
-            # The saved tape is BF16: an FP32 P is rounded only for this copy.
-            self.store_packed(p_stage, p_at, base, cp, count, lane, g0,
-                              saved, Int64(edge) * groups, packed_size(K))
-            # Every lane has read P and stored its saved copy before any lane overwrites it.
+            # Every lane has read P before any lane overwrites it.
             cute.arch.sync_warp()
             if active:
                 quotient = cute.make_rmem_tensor(K, Float32)
@@ -503,7 +498,7 @@ class Forward:
                 width: cutlass.Constexpr, edge: Int32, commit: cutlass.Constexpr,
                 m: cute.Tensor, covariance: cute.Tensor, gain_tape: cute.Tensor,
                 residual_tape: cute.Tensor, denominator_tape: cute.Tensor,
-                read_out: cute.Tensor, saved: cute.Tensor, forgetting: cute.Tensor,
+                read_out: cute.Tensor, forgetting: cute.Tensor,
                 key_tape, query_tape, scale_tape, forgetting_tape):
         S: cutlass.Constexpr = self.stages
         base = warp * self.per_warp
@@ -518,8 +513,7 @@ class Forward:
             cute.arch.sync_warp()
             self.compute_warp(g0, count, base, dense, compact, s * self.dense_elems,
                               s * self.compact_words, lane, width, edge, commit, m,
-                              covariance, gain_tape, residual_tape, denominator_tape, read_out,
-                              saved)
+                              covariance, gain_tape, residual_tape, denominator_tape, read_out)
             # Every lane finished reading this stage before it is released to
             # the async proxy for refilling.
             cute.arch.sync_warp()
@@ -533,7 +527,7 @@ class Forward:
         rawkey: cute.Tensor, query: cute.Tensor, rawvalue: cute.Tensor,
         write_scale: cute.Tensor, forgetting: cute.Tensor,
         gain_tape: cute.Tensor, residual_tape: cute.Tensor,
-        denominator_tape: cute.Tensor, read_out: cute.Tensor, saved: cute.Tensor,
+        denominator_tape: cute.Tensor, read_out: cute.Tensor,
         key_tape: cute.Tensor, query_tape: cute.Tensor, scale_tape: cute.Tensor,
         forgetting_tape: cute.Tensor, edge: Int32,
     ):
@@ -581,12 +575,12 @@ class Forward:
                 if edge == self.E - 1:
                     self.consume(first, stride, mine, dense, compact, full_bars, empty_bars, lane,
                                  warp, width, edge, True, m, covariance, gain_tape,
-                                 residual_tape, denominator_tape, read_out, saved, forgetting,
+                                 residual_tape, denominator_tape, read_out, forgetting,
                                  key_tape, query_tape, scale_tape, forgetting_tape)
                 else:
                     self.consume(first, stride, mine, dense, compact, full_bars, empty_bars, lane,
                                  warp, width, edge, False, m, covariance, gain_tape,
-                                 residual_tape, denominator_tape, read_out, saved, forgetting,
+                                 residual_tape, denominator_tape, read_out, forgetting,
                                  key_tape, query_tape, scale_tape, forgetting_tape)
 
 

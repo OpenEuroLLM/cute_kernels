@@ -251,7 +251,9 @@ class WindowEnd:
     keys, queries, gains, residuals, forgetting_tape, denominators, future_queries, future_keys,
     future_dy, future_dv, m_start, dm_start, future_value_grad,
     future_gain_grad, current_dy, write_scales, dy, dv, dq, covariance_grad, grad_forgetting,
-    grad_rawvalue, grad_rawkey, grad_write_scale, the saved covariance, then the stream.
+    grad_rawvalue, grad_rawkey, grad_write_scale, the running covariance (in: after the window's
+    last edge; out: before its first), the window's pre-write covariances (out, one row per edge,
+    for the interior launches), then the stream.
 
     E is the window length and F the length of the following window, already reversed (with
     F = 0 the future tapes are one-edge placeholders). Of the per-edge gradients only the last
@@ -259,8 +261,10 @@ class WindowEnd:
     launches that follow. m_end and
     m_start may be the same tensor, and so may dm_end and dm_start; the current and future DY
     tapes (and DV tapes) may be slices of one history buffer; current_dy must not alias a
-    written buffer. P comes from the saved covariance tape, and covariance_grad is the FP32
-    gradient of the packed upper triangle of P.
+    written buffer. P is unwound from the running covariance: the state after the window's last
+    edge is staged, and P_{j-1} = lambda_j P_j + den_j kappa_j kappa_j^T (no inverse) gives every
+    edge's pre-write P in FP32, from the gain, denominator and forgetting tapes. covariance_grad
+    is the FP32 gradient of the packed upper triangle of P.
 
     The last edge's dq and -M dv use the committed BF16 m_end. In the first window the start state
     is zero: the end state is rebuilt as sum(g r^T) in FP32 and m_start is written as exact zeros.
@@ -290,8 +294,7 @@ class WindowEnd:
         self.fdy_off = self.rr_off + E * batch * D
         self.fdv_off = self.fdy_off + F * batch * D
         self.cdy_off = self.fdv_off + F * batch * D
-        self.p_off = self.cdy_off + batch * D             # the saved P of the last edge
-        self.dense_elems = _round_up(self.p_off + batch * self.words, 8)
+        self.dense_elems = _round_up(self.cdy_off + batch * D, 8)
         # FP32 words:
         self.c_off = 0
         self.keys_off = _round_up(batch * self.words, 4)
@@ -302,11 +305,14 @@ class WindowEnd:
         self.lam_off = self.fk_off + F * batch * K
         self.den_off = self.lam_off + E * batch
         self.scale_off = self.den_off + E * batch
-        self.compact_words = _round_up(self.scale_off + batch, 4)
+        # The running P: the packed upper triangle padded to 16 bytes, [batch][pw].
+        self.pw = _round_up(self.words, 4)
+        self.p_off = _round_up(self.scale_off + batch, 4)
+        self.compact_words = _round_up(self.p_off + batch * self.pw, 4)
         self.stage_bytes = 2 * self.dense_elems + 4 * self.compact_words
         # The last edge's covariance VJP and the outputs after it keep K lanes busy per group, so
         # they run for 32 // K groups at once. Each group waits for its pack in a per-warp finish
-        # slot: FP32 words [C | key | gain | forgetting, denominator, scale, r.vi], BF16 P and the
+        # slot: FP32 words [C | key | gain | forgetting, denominator, scale, r.vi], FP32 P and the
         # group index.
         self.pack = 32 // K
         self.slot_c = 0
@@ -314,8 +320,8 @@ class WindowEnd:
         self.slot_gain = self.slot_key + K
         self.slot_scalars = self.slot_gain + K
         self.slot_words = self.slot_scalars + 4
-        self.slot_p = _round_up(self.words, 8)
-        self.slot_bytes = self.pack * (4 * self.slot_words + 2 * self.slot_p + 4)
+        self.slot_p = _round_up(self.words, 4)
+        self.slot_bytes = self.pack * (4 * self.slot_words + 4 * self.slot_p + 4)
         self.shared_bytes = self.stages * (self.stage_bytes + 16) + consumers * self.slot_bytes + 128
 
     def _state(self, offset, b, k):
@@ -328,7 +334,7 @@ class WindowEnd:
 
     def _blocks(self, m_end, dm_end, keys, queries, gains, residuals, forgetting_tape,
                 denominators, future_queries, future_keys, future_dy, future_dv, current_dy,
-                write_scales, covariance_grad, saved_p):
+                write_scales, covariance_grad, live_p):
         """(source, first element, rows, row stride, group width, dense?, shared offset) of every
         staged block; group g of row r is at first + r * row stride + g * group width."""
         ng = self.N * self.G
@@ -341,7 +347,7 @@ class WindowEnd:
             blocks += [(future_dy, 0, F, future_dy.stride[0], D, True, self.fdy_off),
                        (future_dv, 0, F, future_dv.stride[0], D, True, self.fdv_off)]
         blocks += [(current_dy, 0, 1, 0, D, True, self.cdy_off),
-                   (saved_p, (E - 1) * ng * self.words, 1, 0, self.words, True, self.p_off),
+                   (live_p, 0, 1, 0, self.pw, False, self.p_off),
                    (covariance_grad, 0, 1, 0, self.words, False, self.c_off),
                    (keys, 0, E, ng * K, K, False, self.keys_off),
                    (queries, 0, E, ng * K, K, False, self.queries_off),
@@ -374,7 +380,7 @@ class WindowEnd:
               forgetting_tape: cute.Tensor, denominators: cute.Tensor, future_queries: cute.Tensor,
               future_keys: cute.Tensor, future_dy: cute.Tensor, future_dv: cute.Tensor,
               current_dy: cute.Tensor, write_scales: cute.Tensor, covariance_grad: cute.Tensor,
-              saved_p: cute.Tensor):
+              live_p: cute.Tensor):
         """Producer warp: stage one batch into (doff, coff) and complete it on ``bar``. Lane 0
         bulk-copies every block it can; the producer lanes copy the rest (unaligned shapes and a
         short last batch) and wait for them before arriving."""
@@ -384,7 +390,7 @@ class WindowEnd:
         full = count == B
         blocks = self._blocks(m_end, dm_end, keys, queries, gains, residuals, forgetting_tape,
                               denominators, future_queries, future_keys, future_dy, future_dv,
-                              current_dy, write_scales, covariance_grad, saved_p)
+                              current_dy, write_scales, covariance_grad, live_p)
         short = count < B
         per_lane = False
         for source, first, rows, row_stride, width, is_dense, offset in blocks:
@@ -438,7 +444,7 @@ class WindowEnd:
                 residuals: cute.Tensor, forgetting_tape: cute.Tensor, denominators: cute.Tensor,
                 future_queries: cute.Tensor, future_keys: cute.Tensor, future_dy: cute.Tensor,
                 future_dv: cute.Tensor, current_dy: cute.Tensor, write_scales: cute.Tensor,
-                covariance_grad: cute.Tensor, saved_p: cute.Tensor):
+                covariance_grad: cute.Tensor, live_p: cute.Tensor):
         S: cutlass.Constexpr = self.stages
         for t in cutlass.range(0, mine, 1):
             s = t % S
@@ -449,7 +455,7 @@ class WindowEnd:
                        s * self.compact_words, full_bars + s, lane, m_end, dm_end, keys,
                        queries, gains, residuals, forgetting_tape, denominators, future_queries,
                        future_keys, future_dy, future_dv, current_dy, write_scales, covariance_grad,
-                       saved_p)
+                       live_p)
 
     @cute.jit
     def consume(self, first, stride, mine, dense: cute.Tensor, compact: cute.Tensor,
@@ -459,7 +465,8 @@ class WindowEnd:
                 future_gain_grad: cute.Tensor, dy: cute.Tensor, dv: cute.Tensor, dq: cute.Tensor,
                 covariance_grad: cute.Tensor, grad_forgetting: cute.Tensor, grad_rawvalue: cute.Tensor,
                 grad_rawkey: cute.Tensor, grad_write_scale: cute.Tensor, slots: cute.Tensor,
-                slot_p: cute.Tensor, slot_groups: cute.Tensor):
+                slot_p: cute.Tensor, slot_groups: cute.Tensor, live_p: cute.Tensor,
+                p_scratch: cute.Tensor):
         S: cutlass.Constexpr = self.stages
         pack: cutlass.Constexpr = self.pack
         slot_base = warp * (pack * self.slot_words)
@@ -473,7 +480,7 @@ class WindowEnd:
         for part in cutlass.range_constexpr(cute.ceil_div(pack * self.slot_p, 32)):
             index = part * 32 + lane
             if index < pack * self.slot_p:
-                slot_p[slot_p_base + index] = BFloat16(0.0)
+                slot_p[slot_p_base + index] = Float32(0.0)
         if lane < pack:
             slot_groups[group_base + lane] = Int32(0)
         # carry holds, in the lanes of each group's run, the two terms of the last edge's gain
@@ -497,7 +504,8 @@ class WindowEnd:
                                  future_value_grad, future_gain_grad, dy, dv,
                                  grad_rawvalue, slots, slot_p, slot_groups,
                                  slot_base + slot * self.slot_words,
-                                 slot_p_base + slot * self.slot_p, group_base + slot, slot, carry)
+                                 slot_p_base + slot * self.slot_p, group_base + slot, slot, carry,
+                                 live_p, p_scratch)
                     done[0] = done[0] + 1
                     if slot == pack - 1:
                         self.finish(pack, slots, slot_p, slot_groups, slot_base, slot_p_base,
@@ -520,7 +528,7 @@ class WindowEnd:
                 future_value_grad: cute.Tensor, future_gain_grad: cute.Tensor,
                 dy: cute.Tensor, dv: cute.Tensor, grad_rawvalue: cute.Tensor, slots: cute.Tensor,
                 slot_p: cute.Tensor, slot_groups: cute.Tensor, sw, sp, sg, slot,
-                carry: cute.Tensor):
+                carry: cute.Tensor, live_p: cute.Tensor, p_scratch: cute.Tensor):
         """Group ``group``, staged as row ``b`` of every block of the batch stage at (doff, coff),
         up to its finish slot ``slot``."""
         n, g = group // self.G, group % self.G
@@ -560,6 +568,34 @@ class WindowEnd:
                 compact[coff + self._row(self.queries_off, edge, b, self.K) + key_index] = h
         alpha = cute.arch.warp_reduction(alpha_part, operator.add)
         cute.arch.sync_warp()
+        # The covariance of every edge of the window, unwound from the running P (the state after
+        # the window's last edge) by P_{j-1} = lam_j P_j + den_j kappa_j kappa_j^T: no inverse, a
+        # contraction on the carried state. Lane row < K holds row ``row`` of P. Every edge's
+        # pre-write P goes to p_scratch for the interior launches, the last edge's also to the
+        # finish slot, and the window's start P back to the running P.
+        prow = cute.make_rmem_tensor(self.K, Float32)
+        prow.fill(0.0)
+        if lane < self.K:
+            for c in cutlass.range_constexpr(self.K):
+                prow[c] = compact[coff + self.p_off + b * self.pw + _symmetric_offset(lane, c, self.K)]
+        for j in cutlass.range_constexpr(self.E - 1, -1, -1):
+            gain_row = _load_fp32_vector(compact, coff + self._row(self.gains_off, j, b, self.K), self.K)
+            lam_j = compact[coff + self._row(self.lam_off, j, b, 1)]
+            den_j = compact[coff + self._row(self.den_off, j, b, 1)]
+            if lane < self.K:
+                gain_lane = compact[coff + self._row(self.gains_off, j, b, self.K) + lane]
+                for c in cutlass.range_constexpr(self.K):
+                    prow[c] = lam_j * prow[c] + den_j * gain_lane * gain_row[c]
+                for c in cutlass.range_constexpr(self.K):
+                    if c >= lane:
+                        packed = _symmetric_offset(lane, c, self.K)
+                        p_scratch[j, n, g, packed] = prow[c]
+                        if cutlass.const_expr(j == self.E - 1):
+                            slot_p[sp + packed] = prow[c]
+        if lane < self.K:
+            for c in cutlass.range_constexpr(self.K):
+                if c >= lane:
+                    live_p[n, g, _symmetric_offset(lane, c, self.K)] = prow[c]
         future_grad_accum = cute.make_rmem_tensor(self.E, Float32)
         future_grad_accum.fill(0.0)
         q_accum, k_accum = Float32(0.0), Float32(0.0)
@@ -717,7 +753,6 @@ class WindowEnd:
             index = part * 32 + lane
             if index < words:
                 slots[sw + self.slot_c + index] = compact[coff + self._row(self.c_off, 0, b, words) + index]
-                slot_p[sp + index] = dense[doff + self._row(self.p_off, 0, b, words) + index]
         if lane < self.K:
             slots[sw + self.slot_key + lane] = compact[coff + self._row(self.keys_off, last, b, self.K) + lane]
             slots[sw + self.slot_gain + lane] = compact[coff + self._row(self.gains_off, last, b, self.K) + lane]
@@ -807,7 +842,8 @@ class WindowEnd:
                  current_dy: cute.Tensor, write_scales: cute.Tensor, dy: cute.Tensor,
                  dv: cute.Tensor, dq: cute.Tensor, covariance_grad: cute.Tensor,
                  grad_forgetting: cute.Tensor, grad_rawvalue: cute.Tensor,
-                 grad_rawkey: cute.Tensor, grad_write_scale: cute.Tensor, saved_p, stream):
+                 grad_rawkey: cute.Tensor, grad_write_scale: cute.Tensor, live_p: cute.Tensor,
+                 p_scratch: cute.Tensor, stream):
         for tensor in (future_dy, future_dv, dy, dv):
             assert tensor.stride[3] == 1
             assert tensor.stride[1] == self.G * tensor.stride[2]
@@ -816,7 +852,8 @@ class WindowEnd:
             assert tensor.stride[2] == self.D
         assert tuple(current_dy.stride) == (self.G * self.D, self.D, 1)
         for tensor, shape, dtype in (
-            (saved_p, (self.E, self.N, self.G, self.words), BFloat16),
+            (live_p, (self.N, self.G, self.pw), Float32),
+            (p_scratch, (self.E, self.N, self.G, self.words), Float32),
             (covariance_grad, (self.N, self.G, self.words), Float32),
         ):
             assert tensor.element_type == dtype
@@ -829,7 +866,8 @@ class WindowEnd:
                     forgetting_tape, denominators, future_queries, future_keys, future_dy,
                     future_dv, m_start, dm_start, future_value_grad,
                     future_gain_grad, current_dy, write_scales, dy, dv, dq, covariance_grad,
-                    grad_forgetting, grad_rawvalue, grad_rawkey, grad_write_scale, saved_p).launch(
+                    grad_forgetting, grad_rawvalue, grad_rawkey, grad_write_scale, live_p,
+                    p_scratch).launch(
                         grid=(self.blocks, 1, 1), block=(self.warps * 32, 1, 1), stream=stream)
 
     @cute.kernel
@@ -843,7 +881,8 @@ class WindowEnd:
                current_dy: cute.Tensor, write_scales: cute.Tensor, dy: cute.Tensor,
                dv: cute.Tensor, dq: cute.Tensor, covariance_grad: cute.Tensor,
                grad_forgetting: cute.Tensor, grad_rawvalue: cute.Tensor,
-               grad_rawkey: cute.Tensor, grad_write_scale: cute.Tensor, saved_p: cute.Tensor):
+               grad_rawkey: cute.Tensor, grad_write_scale: cute.Tensor, live_p: cute.Tensor,
+               p_scratch: cute.Tensor):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
@@ -861,7 +900,7 @@ class WindowEnd:
             self.stages * self.compact_words), byte_alignment=16)
         slots = smem.allocate_tensor(Float32, cute.make_layout(
             self.consumers * self.pack * self.slot_words), byte_alignment=16)
-        slot_p = smem.allocate_tensor(BFloat16, cute.make_layout(
+        slot_p = smem.allocate_tensor(Float32, cute.make_layout(
             self.consumers * self.pack * self.slot_p), byte_alignment=16)
         slot_groups = smem.allocate_tensor(Int32, cute.make_layout(
             self.consumers * self.pack), byte_alignment=16)
@@ -882,12 +921,12 @@ class WindowEnd:
             self.produce(first, stride, mine, dense, compact, full_bars, empty_bars, lane,
                          m_end, dm_end, keys, queries, gains, residuals, forgetting_tape,
                          denominators, future_queries, future_keys, future_dy, future_dv,
-                         current_dy, write_scales, covariance_grad, saved_p)
+                         current_dy, write_scales, covariance_grad, live_p)
         else:
             self.consume(first, stride, mine, dense, compact, full_bars, empty_bars, lane, warp,
                          width, m_start, dm_start, future_value_grad,
                          future_gain_grad, dy, dv, dq, covariance_grad, grad_forgetting, grad_rawvalue,
-                         grad_rawkey, grad_write_scale, slots, slot_p, slot_groups)
+                         grad_rawkey, grad_write_scale, slots, slot_p, slot_groups, live_p, p_scratch)
 
 
 def default_lane_width(D: int) -> int:

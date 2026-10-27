@@ -29,10 +29,11 @@ AXES = {
     "forward": ("batch", "consumers", "blocks_per_sm", "lane_width"),
     "interior": ("warps", "blocks_per_sm", "lane_width"),
     "window_end": ("batch", "consumers", "blocks_per_sm"),
+    "read": ("warps", "blocks_per_sm", "lane_width"),
 }
-# Interior lane width 0 is default_lane_width(D).
-DEFAULTS = {"forward": (32, 8, 1, 8), "interior": (2, 6, 0), "window_end": (4, 4, 2)}
-_SIZE_NAMES = {"forward": "ENGKD", "interior": "ENGKD", "window_end": "EFNGKD"}
+# Interior and read lane width 0 is default_lane_width(D).
+DEFAULTS = {"forward": (32, 8, 1, 8), "interior": (2, 6, 0), "window_end": (4, 4, 2), "read": (4, 4, 0)}
+_SIZE_NAMES = {"forward": "ENGKD", "interior": "ENGKD", "window_end": "EFNGKD", "read": "ENGKD"}
 _TUNE_COMMAND = "python -m cute_ldm.tune"
 
 
@@ -49,6 +50,9 @@ def candidates(kernel: str) -> tuple[tuple[int, ...], ...]:
         schedules = [(batch, consumers, blocks_per_sm) for batch in (4, 8, 16)
                      for consumers in (1, 2, 4, 8, 16) if batch % consumers == 0
                      for blocks_per_sm in (1, 2, 3, 4)]
+    elif kernel == "read":
+        schedules = [(warps, blocks_per_sm, lane_width) for warps in (1, 2, 4, 8)
+                     for blocks_per_sm in (1, 2, 4, 8) for lane_width in (2, 4, 8)]
     else:
         raise ValueError(f"unknown state kernel {kernel!r}")
     default = DEFAULTS[kernel]
@@ -90,6 +94,10 @@ def build_operation(kernel: str, sizes: tuple[int, ...], options: tuple, propert
         from .kernels.window_end import make_window_end as factory
         batch, consumers, blocks_per_sm = schedule
         settings.update(batch=batch, consumers=consumers, blocks_per_sm=blocks_per_sm)
+    elif kernel == "read":
+        from .kernels.read import make_read as factory
+        warps, blocks_per_sm, lane_width = schedule
+        settings.update(warps=warps, blocks_per_sm=blocks_per_sm, lane_width=lane_width or None)
     else:
         raise ValueError(f"unknown state kernel {kernel!r}")
     try:
@@ -121,6 +129,9 @@ def launch_key(kernel: str, sizes: tuple[int, ...], options: tuple, edge: int | 
     words = [kernel] + [f"{name}{size}" for name, size in zip(_SIZE_NAMES[kernel], sizes, strict=True)]
     if dict(options).get("first_window"):
         words.append("first_window")
+    if kernel == "read":
+        settings = dict(options)
+        words.append(f"lo{settings['lo']} hi{settings['hi']} {'end' if settings['from_end'] else 'start'}")
     if _float32_covariance(options):
         words.append("float32_covariance")
     if edge is not None:
