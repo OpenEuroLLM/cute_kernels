@@ -1162,8 +1162,8 @@
   }
  },
  "interior E2 N65536 G16 K8 D128 edge0": {
-  "best_ms": 3.5322,
-  "default_ms": 3.6477,
+  "best_ms": 3.5267,
+  "default_ms": 3.6425,
   "schedule": {
    "blocks_per_sm": 2,
    "lane_width": 2,
@@ -1630,8 +1630,8 @@
   }
  },
  "window_end E1 F0 N65536 G16 K8 D128": {
-  "best_ms": 7.643,
-  "default_ms": 7.8444,
+  "best_ms": 7.6495,
+  "default_ms": 7.8454,
   "schedule": {
    "batch": 16,
    "blocks_per_sm": 1,
@@ -1657,8 +1657,8 @@
   }
  },
  "window_end E2 F0 N65536 G16 K8 D128": {
-  "best_ms": 8.5053,
-  "default_ms": 8.6999,
+  "best_ms": 8.5099,
+  "default_ms": 8.7098,
   "schedule": {
    "batch": 16,
    "blocks_per_sm": 1,
@@ -1672,6 +1672,33 @@
    "batch": 16,
    "blocks_per_sm": 1,
    "consumers": 4
+  }
+ },
+ "window_end E2 F1 N65536 G16 K8 D128": {
+  "best_ms": 8.8537,
+  "default_ms": 9.0883,
+  "schedule": {
+   "batch": 16,
+   "blocks_per_sm": 1,
+   "consumers": 8
+  }
+ },
+ "window_end E2 F2 N65536 G16 K8 D128": {
+  "best_ms": 9.3349,
+  "default_ms": 9.4641,
+  "schedule": {
+   "batch": 16,
+   "blocks_per_sm": 1,
+   "consumers": 8
+  }
+ },
+ "window_end E2 F2 N65536 G16 K8 D128 first_window": {
+  "best_ms": 7.9266,
+  "default_ms": 8.1259,
+  "schedule": {
+   "batch": 16,
+   "blocks_per_sm": 1,
+   "consumers": 8
   }
  },
  "window_end E3 F0 N65536 G16 K8 D128": {
