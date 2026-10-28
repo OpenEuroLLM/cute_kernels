@@ -8,11 +8,13 @@
 ``--tokens`` is the per-GPU micro-batch in tokens (sequences x length) and ``--edges`` the model's
 state edges (2 * layers + 1). ``--value-dim`` is the group width; the kernels run a width that is
 not a multiple of 8 at its padded width, which is the width the table's keys name. One forward
-and backward of a SegmentState of that shape runs on synthetic inputs. At every launch shape it
+and backward of a SegmentState of that shape runs on synthetic inputs, with the recompute read
+kernel's launches (every window size up to the span, from the state at its end and its start)
+between them. At every launch shape it
 measures each candidate schedule of schedules.candidates: a schedule the kernel would not run as named is skipped, every other one
 must reproduce the default schedule's outputs bit for bit, and the fastest (median of CUDA-event
 timings, operands restored before each run) is written to tuned/<arch>.json. ``--kernels`` limits
-the sweep to some of the three kernels, for instance after only one of them changed; the others
+the sweep to some of the four kernels, for instance after only one of them changed; the others
 keep their table entries. ``--running-covariance-dtype float32`` tunes the forward of a model that
 sets that execution setting; its launches have their own table keys. The backward kernels do not
 depend on it, so ``--kernels forward`` is enough when the shape's backward entries exist.
@@ -56,6 +58,13 @@ def _one_pass(args, per_edge, cotangent):
     with torch.no_grad():
         for edge, tensors in enumerate(per_edge):
             ws.forward(edge, *tensors)
+        # the read kernel of activation recompute (Megatron with depth_memory_unwind: a window's
+        # reads from the running state at its end or start, CuteDepthMemoryRecomputeWorkspace's
+        # _recomputed_read): every window size up to the span, whole windows (lo 0, hi = count) as
+        # Megatron launches them, both state positions. Reads only: the state and tapes are kept.
+        for count in range(1, min(args.span, args.edges) + 1):
+            for from_end in (True, False):
+                ws.recompute_reads(0, count, 0, count, from_end)
         for edge in reversed(range(args.edges)):
             ws.backward(edge, cotangent)
     torch.cuda.synchronize()
@@ -201,7 +210,7 @@ def main():
                         default="float32", help="the running covariance dtype (Megatron default float32)")
     parser.add_argument("--reps", type=int, default=7)
     parser.add_argument("--kernels", nargs="+", choices=tuple(schedules.AXES), default=tuple(schedules.AXES),
-                        help="the kernels to tune (default: all three)")
+                        help="the kernels to tune (default: all four)")
     parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1),
                         help="processes compiling the candidates ahead of the measurements")
     parser.add_argument("--record", help="also write every measurement to this JSON file")
