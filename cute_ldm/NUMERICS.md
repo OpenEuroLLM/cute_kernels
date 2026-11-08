@@ -117,6 +117,43 @@ entry within 2 %, except the forgetting gradient (a sum over tokens), which vari
    after ~80 edges. So an FP32 oracle without symmetrization is no reference for deep chains with
    strong forgetting.
 
+## FP16 storage (FP16 training, 2026-11-08)
+
+`CuteDepthMemoryWorkspace(..., storage_dtype="float16")` (Megatron sets it under `fp16`) keeps M,
+dM, the residual tape, the reads, DY / DV and the raw value gradient in FP16; the kernels take the
+16-bit type from their operands, and the shared staging panels and the interior's tensor-core
+operands use it too (f16 x f16 -> FP32 MMA; vi split into three FP16 parts, exact down to the
+subnormal floor 2^-24 of the last part). Everything else is unchanged: FP32 arithmetic, the
+packed FP32 P, the same schedules (FP16 has BF16's width, so the launch keys and the tuned tables
+apply). `python -m cute_ldm.numerics --storage float16`; FP16 inputs (values, cotangents).
+
+Worst edge against FP64 (GH200, CuTe DSL 4.7.1, seed 0); the floor is the FP64 result rounded to
+FP16:
+
+| regime | impl | read | recomputed_read | khat | query | value | scale | forgetting | unwound_m | unwound_p |
+|---|---|---|---|---|---|---|---|---|---|---|
+| nominal | floor | 2.1e-04 |  | 2.1e-04 | 2.1e-04 | 2.1e-04 | 2.1e-04 | 3.0e-04 |  |  |
+| nominal | cute | 6.4e-04 |  | 6.0e-04 | 1.1e-03 | 5.1e-04 | 5.4e-04 | 8.2e-04 | 1.1e-03 | 2.5e-07 |
+| nominal | cute_recompute | 6.4e-04 | 4.1e-03 | 8.9e-04 | 2.4e-03 | 6.7e-04 | 6.9e-04 | 7.6e-04 |  |  |
+| forget_0.85 | cute | 4.5e-04 |  | 8.0e-04 | 2.1e-03 | 4.1e-04 | 4.7e-04 | 8.5e-04 | 2.4e-03 | 2.9e-07 |
+| forget_0.85 | cute_recompute | 4.5e-04 | 7.5e-03 | 1.2e-03 | 4.2e-03 | 4.7e-04 | 5.4e-04 | 8.2e-04 |  |  |
+| aligned_keys | cute | 6.5e-04 |  | 6.7e-04 | 2.3e-03 | 6.5e-04 | 6.8e-04 | 5.9e-04 | 2.5e-03 | 3.2e-07 |
+| aligned_keys | cute_recompute | 6.5e-04 | 6.1e-03 | 9.2e-04 | 5.2e-03 | 8.8e-04 | 9.0e-04 | 1.0e-03 |  |  |
+| aligned_forget | cute | 6.5e-04 |  | 8.5e-04 | 7.6e-03 | 6.3e-04 | 7.9e-04 | 1.1e-03 | 8.5e-03 | 1.1e-06 |
+| aligned_forget | cute_recompute | 6.5e-04 | 1.8e-02 | 1.1e-03 | 1.5e-02 | 8.1e-04 | 9.5e-04 | 1.1e-03 |  |  |
+| heavy_writes | cute | 6.5e-04 |  | 6.4e-04 | 7.5e-04 | 5.0e-04 | 5.5e-04 | 8.3e-04 | 8.1e-04 | 3.3e-07 |
+| heavy_writes | cute_recompute | 6.5e-04 | 3.1e-03 | 8.9e-04 | 1.7e-03 | 6.6e-04 | 7.0e-04 | 1.0e-03 |  |  |
+| value_growth | cute | 5.3e-04 |  | 1.0e-03 | 4.6e-03 | 5.1e-04 | 5.1e-04 | 4.6e-04 | 5.2e-03 | 2.5e-07 |
+| value_growth | cute_recompute | 5.3e-04 | 2.1e-02 | 1.9e-03 | 1.1e-02 | 6.7e-04 | 6.8e-04 | 6.1e-04 |  |  |
+
+- Every entry is ~8x below BF16's (three more mantissa bits), at the same multiple of its floor:
+  the forward ~3x, the gradients 2-9x. The unwound-M quantities shrink the same way: the
+  recomputed reads 0.17 -> 0.021 (value_growth), 3.3e-2 -> 4.1e-3 (nominal); the recompute query
+  gradient 9.0e-2 -> 1.1e-2 (value_growth). Findings 3 and 4 remain, 8x smaller.
+- No range problem in any regime (largest M rms 3.5, value_growth); FP16's 65504 limit is far.
+- The BF16 path is unchanged (its tests pass on the new code); the tests hold FP16 to the same
+  bounds relative to its floor and to the BF16 absolute bounds / 8.
+
 ## Possible fixes (not implemented)
 
 - **M in FP32** for the running state the backward unwinds. The subtraction's error would then

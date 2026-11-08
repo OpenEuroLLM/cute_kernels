@@ -16,7 +16,8 @@ per edge it measures, against the FP64 chain of cute_ldm.reference:
 - the conditioning of the FP64 state (cute_ldm.reference.diagnostics).
 
 Inputs are exact in every dtype (values BF16, the rest FP32), so every error is the
-implementation's. Tokens and groups are independent recurrences: 512 tokens x 16 groups = 8192
+implementation's. ``--storage float16`` runs the kernels with FP16 tapes and state (FP16
+training): values and cotangents FP16, the floor the FP64 result rounded to FP16. Tokens and groups are independent recurrences: 512 tokens x 16 groups = 8192
 chains per regime.
 """
 
@@ -24,6 +25,8 @@ import argparse
 import json
 
 import torch
+
+STORAGE = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 
 from . import reference
 
@@ -35,9 +38,9 @@ def _unit(x):
     return torch.nn.functional.normalize(x, dim=-1)
 
 
-def make_steps(regime, edges, n, g, k, d, seed=0, device="cuda"):
+def make_steps(regime, edges, n, g, k, d, seed=0, device="cuda", storage="bfloat16"):
     """Per edge (khat, query, value, scale, forgetting [G]) and the read cotangents, for one of
-    REGIMES."""
+    REGIMES; values and cotangents in the 16-bit ``storage`` type."""
     gen = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(*shape):
@@ -58,11 +61,11 @@ def make_steps(regime, edges, n, g, k, d, seed=0, device="cuda"):
             khat = _unit(rnd(n, g, k))
         query = _unit(rnd(n, g, k)) * (1 + 0.3 * rnd(n, g, 1))
         growth = 1 + spec.get("value_growth", 0.0) * e
-        value = (growth * rnd(n, g, d)).to(torch.bfloat16)
+        value = (growth * rnd(n, g, d)).to(STORAGE[storage])
         scale = uni(s_lo, s_hi, n, g)
         forgetting = uni(lam_lo, lam_hi, g)
         steps.append((khat, query, value, scale, forgetting))
-    cot = [(0.1 * rnd(n, g, d)).to(torch.bfloat16) for _ in range(edges)]
+    cot = [(0.1 * rnd(n, g, d)).to(STORAGE[storage]) for _ in range(edges)]
     return steps, cot
 
 
@@ -107,7 +110,7 @@ def unpack_p(packed, k):
 
 
 # -- the kernels -------------------------------------------------------------------------------
-def run_cute(steps, cot, *, alpha, span, window_states=True):
+def run_cute(steps, cot, *, alpha, span, window_states=True, storage="bfloat16"):
     """CuteDepthMemoryWorkspace over the chain: reads, gradients, and the unwound state (M, P) at
     every window start s > 0 right after its window-end launch, ``{s: (M, P [N,G,K,K])}``."""
     from .workspace import CuteDepthMemoryWorkspace
@@ -116,7 +119,8 @@ def run_cute(steps, cot, *, alpha, span, window_states=True):
     n, g, k = steps[0][0].shape
     d = steps[0][2].shape[-1]
     ws = CuteDepthMemoryWorkspace(total_edges=L, groups=g, key_dim=k, value_dim=d, alpha=alpha,
-                                  span=span, running_covariance_dtype="float32")
+                                  span=span, running_covariance_dtype="float32",
+                                  storage_dtype=storage)
     ws.ensure(n, "cuda")
     reads, fwd_states = [], {}
     for e in range(L):
@@ -143,7 +147,7 @@ def recompute_groups(edges, per_group):
     return groups
 
 
-def run_cute_recompute(steps, cot, *, alpha, span, per_group=2):
+def run_cute_recompute(steps, cot, *, alpha, span, per_group=2, storage="bfloat16"):
     """CuteRecomputeWorkspace driven in Megatron's order (depth_memory.py, DepthMemoryStepX /
     ReadFromWorkspace / StreamWrite): the forward with records into each group's stream, then the
     collapse's backward and the groups recomputed last first. Returns the forward reads, the
@@ -155,13 +159,15 @@ def run_cute_recompute(steps, cot, *, alpha, span, per_group=2):
     d = steps[0][2].shape[-1]
     h = g * d
     ws = CuteRecomputeWorkspace(total_edges=L, groups=g, key_dim=k, value_dim=d, alpha=alpha,
-                                span=span, running_covariance_dtype="float32")
+                                span=span, running_covariance_dtype="float32",
+                                storage_dtype=storage)
     groups = recompute_groups(L, per_group)
     ws.layout(groups, h)
     ws.ensure(n, "cuda")
-    slots = ws.stream_slots(torch.bfloat16)
+    dtype = STORAGE[storage]   # the stream's dtype is the model's (FP16 training: FP16)
+    slots = ws.stream_slots(dtype)
     streams = []   # each group's output stream [slots, n, h] (x unused: zeros)
-    prev = torch.zeros(slots, n, h, dtype=torch.bfloat16, device="cuda")
+    prev = torch.zeros(slots, n, h, dtype=dtype, device="cuda")
     reads = [None] * L
     for first, count in groups:
         stream = prev.clone()
@@ -191,9 +197,11 @@ def run_cute_recompute(steps, cot, *, alpha, span, per_group=2):
 
 # -- one regime --------------------------------------------------------------------------------
 def analyse(regime, *, edges=97, n=512, g=16, k=8, d=128, alpha=1.0, span=4, per_group=2,
-            seed=0, cute=True, recompute=True):
+            seed=0, cute=True, recompute=True, storage="bfloat16"):
+    """One regime; ``storage`` the kernels' 16-bit type. The floor (``floor``, also under its
+    old name ``bf16_floor`` for BF16) is the FP64 result rounded to that type."""
     torch.backends.cuda.matmul.allow_tf32 = False
-    steps, cot = make_steps(regime, edges, n, g, k, d, seed=seed)
+    steps, cot = make_steps(regime, edges, n, g, k, d, seed=seed, storage=storage)
     window_ends = [e for e in range(edges) if (e + 1) % span == 0 or e == edges - 1]
     starts = [s for s in range(span, edges, span)]
     keep = sorted(set(window_ends) | {s - 1 for s in starts})
@@ -201,7 +209,8 @@ def analyse(regime, *, edges=97, n=512, g=16, k=8, d=128, alpha=1.0, span=4, per
     f32_reads, f32_grads, _ = reference.chain(steps, alpha, torch.float32, cot)
     sym_reads, sym_grads, _ = reference.chain(steps, alpha, torch.float32, cot, symmetric=True)
     out = dict(regime=regime, edges=edges, n=n, g=g, k=k, d=d, alpha=alpha, span=span,
-               per_group=per_group, diagnostics=reference.diagnostics(steps, alpha), impl={})
+               per_group=per_group, storage=storage,
+               diagnostics=reference.diagnostics(steps, alpha), impl={})
 
     def score(reads, grads):
         res = dict(read=[rel(r, ref) for r, ref in zip(reads, ref_reads)],
@@ -212,10 +221,13 @@ def analyse(regime, *, edges=97, n=512, g=16, k=8, d=128, alpha=1.0, span=4, per
 
     out["impl"]["fp32_torch"] = score(f32_reads, f32_grads)
     out["impl"]["fp32_torch_sym"] = score(sym_reads, sym_grads)
-    bf16 = [[t.to(torch.bfloat16) for t in gr] for gr in ref_grads]
-    out["impl"]["bf16_floor"] = score([r.to(torch.bfloat16) for r in ref_reads], bf16)
+    half = STORAGE[storage]
+    rounded = [[t.to(half) for t in gr] for gr in ref_grads]
+    out["impl"]["floor"] = score([r.to(half) for r in ref_reads], rounded)
+    if storage == "bfloat16":
+        out["impl"]["bf16_floor"] = out["impl"]["floor"]
     if cute:
-        got = run_cute(steps, cot, alpha=alpha, span=span)
+        got = run_cute(steps, cot, alpha=alpha, span=span, storage=storage)
         res = score(got["reads"], got["grads"])
         res["fwd_m"] = {e: rel(m, ref_states[e][0]) for e, (m, _) in got["fwd_states"].items()}
         res["fwd_p"] = {e: rel(p, ref_states[e][1]) for e, (_, p) in got["fwd_states"].items()}
@@ -224,7 +236,8 @@ def analyse(regime, *, edges=97, n=512, g=16, k=8, d=128, alpha=1.0, span=4, per
         out["impl"]["cute"] = res
         del got
     if recompute:
-        got = run_cute_recompute(steps, cot, alpha=alpha, span=span, per_group=per_group)
+        got = run_cute_recompute(steps, cot, alpha=alpha, span=span, per_group=per_group,
+                                 storage=storage)
         res = score(got["reads"], got["grads"])
         res["recomputed_read"] = {e: rel(r, ref_reads[e]) for e, r in got["recomputed"].items()}
         res["recomputed_vs_forward"] = {e: rel(r, got["reads"][e])
@@ -243,6 +256,8 @@ def table(results):
              "|---|---|" + "---|" * len(cols)]
     for res in results:
         for name, impl in res["impl"].items():
+            if name == "bf16_floor":
+                continue   # the same entry as "floor"
             cells = []
             for c in cols:
                 if c in impl and len(impl[c]):
@@ -273,6 +288,8 @@ def main(argv=None):
     ap.add_argument("--span", type=int, default=4)
     ap.add_argument("--per-group", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--storage", choices=sorted(STORAGE), default="bfloat16",
+                    help="the kernels' 16-bit tape / state type (float16: FP16 training)")
     ap.add_argument("--no-cute", action="store_true", help="references only (any GPU)")
     ap.add_argument("--out", default=None, help="JSON with every per-edge curve")
     args = ap.parse_args(argv)
@@ -281,7 +298,7 @@ def main(argv=None):
         res = analyse(regime, edges=args.edges, n=args.tokens, g=args.groups, k=args.key_dim,
                       d=args.value_dim, alpha=args.alpha, span=args.span,
                       per_group=args.per_group, seed=args.seed, cute=not args.no_cute,
-                      recompute=not args.no_cute)
+                      recompute=not args.no_cute, storage=args.storage)
         results.append(res)
         print(f"[{regime}] done", flush=True)
         torch.cuda.empty_cache()

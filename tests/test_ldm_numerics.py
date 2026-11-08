@@ -5,7 +5,11 @@ measured numbers are in cute_ldm/NUMERICS.md. `pytest tests/test_ldm_numerics.py
 The bounds are relative to the BF16 floor (the FP64 result rounded to BF16, ~1.7e-3 normwise) and
 sit ~1.5-2x above the measured worst case (GH200, CuTe DSL 4.7.1). The query gradient and the
 recomputed reads get separate, wider bounds: they come from the BF16 M the backward unwinds by
-subtraction, whose absolute error follows the largest state of the chain (NUMERICS.md)."""
+subtraction, whose absolute error follows the largest state of the chain (NUMERICS.md).
+
+The FP16 storage (FP16 training) is held to the same bounds relative to its own floor (the FP64
+result rounded to FP16, ~2.1e-4) and to the BF16 absolute bounds / 8 (three more mantissa bits;
+measured ~8x below BF16 everywhere, GH200, CuTe DSL 4.7.1)."""
 import pytest
 import torch
 
@@ -83,22 +87,37 @@ QUERY = dict(nominal=0.04, aligned_forget=0.2, value_growth=0.15)       # others
 RECOMPUTED = dict(nominal=0.06, aligned_forget=0.3, value_growth=0.3)   # others 0.12
 
 
-@pytest.fixture(scope="module", params=list(numerics.REGIMES))
+# the same for FP16 storage: BF16's absolute bounds / 8 (measured worst cases ~half of these)
+QUERY_FP16 = dict(nominal=0.005, aligned_forget=0.03, value_growth=0.02)        # others 0.01
+RECOMPUTED_FP16 = dict(nominal=0.0075, aligned_forget=0.0375, value_growth=0.0375)  # others 0.015
+
+
+@pytest.fixture(scope="module",
+                params=[(regime, storage) for storage in ("bfloat16", "float16")
+                        for regime in numerics.REGIMES],
+                ids=lambda param: f"{param[0]}-{param[1]}")
 def analysis(request):
     if not _hopper():
         pytest.skip("cute_ldm needs sm90 / sm100")
-    return numerics.analyse(request.param)
+    regime, storage = request.param
+    return numerics.analyse(regime, storage=storage)
+
+
+def _query_bound(analysis):
+    if analysis["storage"] == "float16":
+        return QUERY_FP16.get(analysis["regime"], 0.01)
+    return QUERY.get(analysis["regime"], 0.08)
 
 
 def test_reads_and_gradients(analysis):
-    floor = analysis["impl"]["bf16_floor"]
+    floor = analysis["impl"]["floor"]
     regime = analysis["regime"]
     for impl in ("cute", "cute_recompute"):
         res = analysis["impl"][impl]
         for name, bound in BOUNDS.items():
             worst, ref = max(res[name]), max(floor[name])
             assert worst < bound * ref, (regime, impl, name, worst, ref)
-        assert max(res["query"]) < QUERY.get(regime, 0.08), (regime, impl, max(res["query"]))
+        assert max(res["query"]) < _query_bound(analysis), (regime, impl, max(res["query"]))
 
 
 def test_recomputed_reads(analysis):
@@ -107,15 +126,18 @@ def test_recomputed_reads(analysis):
     # the forward reads are the kernels' without recompute, bit for bit
     assert res["read"] == analysis["impl"]["cute"]["read"]
     worst = max(res["recomputed_read"].values())
-    assert worst < RECOMPUTED.get(regime, 0.12), (regime, worst)
+    if analysis["storage"] == "float16":
+        assert worst < RECOMPUTED_FP16.get(regime, 0.015), (regime, worst)
+    else:
+        assert worst < RECOMPUTED.get(regime, 0.12), (regime, worst)
 
 
 def test_unwound_state(analysis):
-    """The backward's state at every window start: P (FP32, by addition) to ~1e-6; M (BF16, by
-    subtraction) within the query gradient's bound."""
+    """The backward's state at every window start: P (FP32, by addition) to ~1e-6; M (16-bit,
+    by subtraction) within the query gradient's bound."""
     res = analysis["impl"]["cute"]
     regime = analysis["regime"]
     assert max(res["unwound_p"].values()) < 1e-5, regime
-    assert max(res["unwound_m"].values()) < QUERY.get(regime, 0.08), regime
-    # the forward's committed M stays at the BF16 floor's order at every depth
-    assert max(res["fwd_m"].values()) < 4 * max(analysis["impl"]["bf16_floor"]["read"]), regime
+    assert max(res["unwound_m"].values()) < _query_bound(analysis), regime
+    # the forward's committed M stays at the floor's order at every depth
+    assert max(res["fwd_m"].values()) < 4 * max(analysis["impl"]["floor"]["read"]), regime

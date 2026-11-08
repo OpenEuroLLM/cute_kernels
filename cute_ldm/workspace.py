@@ -42,7 +42,8 @@ def _program(kernel: str, options: tuple, sizes: tuple[int, ...], metadata: tupl
     from cutlass import cute
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-    types = {torch.bfloat16: cutlass.BFloat16, torch.float32: cutlass.Float32}
+    types = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16,
+             torch.float32: cutlass.Float32}
     fake = [None if item is None else make_fake_tensor(
         types[item[0]], item[1], item[2], assumed_align=item[3]) for item in metadata]
     if kernel in ("forward", "interior"):
@@ -136,6 +137,9 @@ _STATIC_ARGS = {}
 
 # The dtypes the forward may keep the running covariance in.
 RUNNING_COVARIANCE_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+# The 16-bit types of M, dM, the residual / read / DY / DV tapes and the value gradients: BF16, or
+# FP16 for FP16 training (the kernels take it from their operands).
+STORAGE_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -149,7 +153,8 @@ class CuteDepthMemoryWorkspace:
     """The tapes and buffers of ``total_edges`` LDM steps for ``n`` tokens (see module doc)."""
 
     def __init__(self, *, total_edges: int, groups: int, key_dim: int, value_dim: int,
-                 alpha: float = 1.0, span: int = 4, running_covariance_dtype: str = "float32"):
+                 alpha: float = 1.0, span: int = 4, running_covariance_dtype: str = "float32",
+                 storage_dtype: str = "bfloat16"):
         if key_dim not in (4, 8, 16):
             raise ValueError("cute_ldm: the key dimension must be 4, 8 or 16")
         if running_covariance_dtype != "float32":
@@ -160,6 +165,9 @@ class CuteDepthMemoryWorkspace:
         self.padded_value_dim = -(-value_dim // 8) * 8
         self.covariance_scale = float(alpha)
         self.running_covariance_dtype = running_covariance_dtype
+        if storage_dtype not in STORAGE_DTYPES:
+            raise ValueError(f"cute_ldm: storage_dtype must be one of {sorted(STORAGE_DTYPES)}")
+        self.storage = STORAGE_DTYPES[storage_dtype]
         self.n = None
 
     # -- buffers -------------------------------------------------------------------------------
@@ -177,7 +185,7 @@ class CuteDepthMemoryWorkspace:
         def empty(shape, dtype=torch.float32):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
-        self.m = empty((n, g, k, d), torch.bfloat16)
+        self.m = empty((n, g, k, d), self.storage)
         dtype = RUNNING_COVARIANCE_DTYPES[self.running_covariance_dtype]
         per_16_bytes = 16 // dtype.itemsize
         triangle = k * (k + 1) // 2
@@ -192,10 +200,10 @@ class CuteDepthMemoryWorkspace:
         # the window's pre-write covariances, FP32, unwound by its window-end launch for its
         # interior launches
         self.p_scratch = empty((rows, n, g, triangle))
-        self.dm = empty((n, g, k, d), torch.bfloat16)
+        self.dm = empty((n, g, k, d), self.storage)
         self.covariance_grad = empty((n, g, triangle))
         self.future_value_grad = empty((rows, n, g, d))
-        self.dy, self.dv = [empty((rows, n, g, d), torch.bfloat16) for _ in range(2)]
+        self.dy, self.dv = [empty((rows, n, g, d), self.storage) for _ in range(2)]
         self.future_gain_grad = empty((rows, n, g, k))
         self._allocate_reads(n)
         self._register_buffers()
@@ -206,7 +214,7 @@ class CuteDepthMemoryWorkspace:
 
     def _allocate_reads(self, n: int) -> None:
         self.reads = torch.empty((self.span, n, self.groups, self.padded_value_dim),
-                                 dtype=torch.bfloat16, device=self.device)   # recompute_reads output
+                                 dtype=self.storage, device=self.device)   # recompute_reads output
 
     def _allocate_tapes(self, n: int) -> None:
         """The per-edge tapes, [edge, n, g, ...] over every edge."""
@@ -216,7 +224,7 @@ class CuteDepthMemoryWorkspace:
             return torch.empty(shape, dtype=dtype, device=self.device)
 
         self.keys, self.queries, self.gains = [empty((length, n, g, k)) for _ in range(3)]
-        self.residuals = empty((length, n, g, d), torch.bfloat16)
+        self.residuals = empty((length, n, g, d), self.storage)
         self.denominators, self.forgetting_tape, self.scales = [empty((length, n, g))
                                                                 for _ in range(3)]
 
@@ -254,7 +262,7 @@ class CuteDepthMemoryWorkspace:
         forgetting = torch.broadcast_to(forgetting.float(), (n, g))
         if forgetting.stride() != (0, 1):
             forgetting = _aligned(forgetting)
-        value = self._padded(value.to(torch.bfloat16).contiguous().view(n, g, self.value_dim))
+        value = self._padded(value.to(self.storage).contiguous().view(n, g, self.value_dim))
         read = torch.empty_like(value)
         tapes = [self.keys[edge], self.queries[edge], self.scales[edge], self.forgetting_tape[edge]]
         sizes = (end - start, n, g, k, self.padded_value_dim)
@@ -281,11 +289,11 @@ class CuteDepthMemoryWorkspace:
         forgetting_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
         query_output = query_grad.expand(count, n, g, k)
         forgetting_output = forgetting_grad.expand(count, n, g)
-        raw_value_grad = torch.empty((n, g, d), device=self.device, dtype=torch.bfloat16)
+        raw_value_grad = torch.empty((n, g, d), device=self.device, dtype=self.storage)
         raw_key_grad = torch.empty((n, g, k), device=self.device, dtype=torch.float32)
         scale_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
         current_dy = _aligned(self._padded(
-            read_grad.to(torch.bfloat16).reshape(n, g, self.value_dim)))
+            read_grad.to(self.storage).reshape(n, g, self.value_dim)))
         if edge == end - 1:
             # the window end; its future window is the next one (processed just before)
             fs, fe = end, min(end + self.span, self.total_edges)
@@ -319,8 +327,8 @@ class CuteDepthMemoryWorkspace:
     @torch.no_grad()
     def recompute_reads(self, start, end, lo, hi, from_end: bool) -> torch.Tensor:
         """The reads of the local edges [lo, hi) of the window [start, end) from the running state,
-        which is at that window's end (``from_end``) or its start; [hi - lo, n, G, D] BF16 (padded
-        width sliced off)."""
+        which is at that window's end (``from_end``) or its start; [hi - lo, n, G, D] in the
+        storage type (padded width sliced off)."""
         n, g, k, d = self.n, self.groups, self.key_dim, self.padded_value_dim
         count = end - start
         _launch("read", (count, n, g, k, d),
@@ -338,7 +346,7 @@ class CuteDepthMemoryWorkspace:
     # "future" tapes), so at a segment start they are folded into dM here (export_grad) and the
     # previous segment's last window runs with no future, from the carried dM.
     def load_state(self, m: torch.Tensor, p: torch.Tensor) -> None:
-        """Start the next forward from M ``[n, G, K, D]`` (bf16) and the packed running P."""
+        """Start the next forward from M ``[n, G, K, D]`` (storage type) and the packed running P."""
         self.m.copy_(m.view_as(self.m))
         self.p.copy_(p.view_as(self.p))
         self.state_loaded = True
@@ -370,18 +378,18 @@ class CuteDepthMemoryWorkspace:
         return dm, self.covariance_grad
 
     def grad_buffers(self):
-        """The buffers the backward starts from (load_grad's targets): dM bf16, dP fp32."""
+        """The buffers the backward starts from (load_grad's targets): dM (storage type), dP fp32."""
         return self.dm, self.covariance_grad
 
     def state_layout(self):
         """(per-token shape, dtype) of the carried state (M, P as the workspace keeps them) and of
-        its gradient (dM bf16 as the backward keeps it, dP the fp32 packed triangle)."""
+        its gradient (dM in the storage type as the backward keeps it, dP the fp32 packed triangle)."""
         g, k, d = self.groups, self.key_dim, self.padded_value_dim
         dtype = RUNNING_COVARIANCE_DTYPES[self.running_covariance_dtype]
         per16 = 16 // dtype.itemsize
         tri = k * (k + 1) // 2
-        state = [((g, k, d), torch.bfloat16), ((g, -(-tri // per16) * per16), dtype)]
-        grad = [((g, k, d), torch.bfloat16), ((g, tri), torch.float32)]
+        state = [((g, k, d), self.storage), ((g, -(-tri // per16) * per16), dtype)]
+        grad = [((g, k, d), self.storage), ((g, tri), torch.float32)]
         return state, grad
 
 
@@ -500,8 +508,8 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         return 1 + self.record_slots + self._small_slots(dtype)
 
     def _small_width(self, dtype) -> int:
-        if dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError(f"cute_ldm recompute: a {dtype} stream (bfloat16 or float32)")
+        if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise ValueError(f"cute_ldm recompute: a {dtype} stream (bfloat16, float16 or float32)")
         return self.small_words * 4 // dtype.itemsize
 
     def _small_layout(self, dtype):
@@ -578,7 +586,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         shapes = ((k,), (k,), (k,), (d,), (), (), ())
         self._forward_tapes = {}
         for name, shape in zip(names, shapes):
-            pool, forward = tape(*shape, dtype=torch.bfloat16 if name == "residuals" else torch.float32)
+            pool, forward = tape(*shape, dtype=self.storage if name == "residuals" else torch.float32)
             setattr(self, name, pool)
             self._forward_tapes[name] = forward
 
@@ -649,7 +657,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             local = e - self.windows[self.window_of[e]][0]
             j = e - first
             u = records[j].reshape(n, g, self.value_dim)
-            self.residuals[slot, local].copy_(self._padded(u.to(torch.bfloat16)))
+            self.residuals[slot, local].copy_(self._padded(u.to(self.storage)))
             words = self._get_small(records, j)
             keys, queries, gains, den, forget, scale = words.split(self.small_parts, dim=1)
             self.keys[slot, local].copy_(keys.reshape(n, g, k))
@@ -684,7 +692,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             forgetting = torch.broadcast_to(forgetting.float(), (n, g))
             if forgetting.stride() != (0, 1):
                 forgetting = _aligned(forgetting)
-            value = self._padded(value.to(torch.bfloat16).contiguous().view(n, g, self.value_dim))
+            value = self._padded(value.to(self.storage).contiguous().view(n, g, self.value_dim))
             read = torch.empty_like(value)
             local = edge - start
             t = self._forward_tapes
@@ -711,7 +719,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         return None
 
     def read(self, edge) -> torch.Tensor:
-        """The read of edge ``edge`` for the sublayer after it, [n, G, D] BF16: in the forward the
+        """The read of edge ``edge`` for the sublayer after it, [n, G, D] (storage type): in the forward the
         step's own read, under recompute the read kernel's from the running state."""
         pending = self._pending is not None and self._pending[0] == edge
         if self._phase == "forward" or (pending and not self._final_consumed):
@@ -742,7 +750,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             slot = self._slot(w)
             n, g, k, d = self.n, self.groups, self.key_dim, self.padded_value_dim
             count = end - start
-            reads = torch.empty((count, n, g, d), dtype=torch.bfloat16, device=self.device)
+            reads = torch.empty((count, n, g, d), dtype=self.storage, device=self.device)
             _launch("read", (count, n, g, k, d),
                     [self.m, self.queries[slot, :count], self.gains[slot, :count],
                      self.residuals[slot, :count], reads],
@@ -779,10 +787,10 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         forgetting_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
         query_output = query_grad.expand(count, n, g, k)
         forgetting_output = forgetting_grad.expand(count, n, g)
-        raw_value_grad = torch.empty((n, g, d), device=self.device, dtype=torch.bfloat16)
+        raw_value_grad = torch.empty((n, g, d), device=self.device, dtype=self.storage)
         raw_key_grad = torch.empty((n, g, k), device=self.device, dtype=torch.float32)
         scale_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
-        current_dy = _aligned(self._padded(read_grad.to(torch.bfloat16).reshape(n, g, self.value_dim)))
+        current_dy = _aligned(self._padded(read_grad.to(self.storage).reshape(n, g, self.value_dim)))
         if edge == end - 1:
             if w + 1 < len(self.windows):
                 fslot = self._slot(w + 1)

@@ -14,8 +14,8 @@ forgetting tapes. A forgetting operand with a zero token stride (one factor per 
 from global memory instead of being staged.
 
 The arithmetic is FP32 with a fixed summation order over the K lanes and a fixed column update
-order. Residuals are rounded to BF16 before they are reused; the reads and the committed M
-are stored in BF16. The running covariance (16-byte padded rows) is stored in BF16 or, with
+order. Residuals are rounded to the 16-bit storage type (BF16, or FP16 for FP16 training; that of
+M) before they are reused; the reads and the committed M are stored in it. The running covariance (16-byte padded rows) is stored in BF16 or, with
 ``running_covariance_dtype="float32"``, in FP32.
 """
 
@@ -28,6 +28,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, cute
 from cutlass.utils import SmemAllocator
 
 from .window_end import (
+    STORAGE_TYPES,
     _bulk_g2s,
     _load_dense,
     _load_fp32_vector,
@@ -86,7 +87,7 @@ class Forward:
 
     def _layout(self):
         K, D, batch = self.K, self.D, self.batch
-        # BF16 part of a stage: M blocks, value rows and the earlier residual rows of the window;
+        # 16-bit part of a stage: M blocks, value rows and the earlier residual rows of the window;
         # every region starts 16-byte aligned so bulk copies can target it.
         self.m_off = 0
         self.v_off = 0 if self.first_window else _round_up(batch * K * D, 8)
@@ -126,17 +127,21 @@ class Forward:
         key_tape: cute.Tensor, query_tape: cute.Tensor, scale_tape: cute.Tensor,
         forgetting_tape: cute.Tensor, edge: Int32, stream: cuda.CUstream,
     ):
+        storage = m.element_type   # the 16-bit type of M and the value / residual / read rows
+        assert storage in STORAGE_TYPES
+        # A BF16 running covariance is staged in the 16-bit panel.
+        assert self.covariance_type is Float32 or self.covariance_type is storage
         for tensor, shape, dtype in (
-            (m, (self.N, self.G, self.K, self.D), BFloat16),
+            (m, (self.N, self.G, self.K, self.D), storage),
             (covariance, (self.N, self.G, self.pw16), self.covariance_type),
             (rawkey, (self.N, self.G, self.K), Float32),
             (query, (self.N, self.G, self.K), Float32),
-            (rawvalue, (self.N, self.G, self.D), BFloat16),
+            (rawvalue, (self.N, self.G, self.D), storage),
             (write_scale, (self.N, self.G), Float32),
             (gain_tape, self.gain_tape_shape, Float32),
-            (residual_tape, self.residual_tape_shape, BFloat16),
+            (residual_tape, self.residual_tape_shape, storage),
             (denominator_tape, self.denominator_tape_shape, Float32),
-            (read_out, (self.N, self.G, self.D), BFloat16),
+            (read_out, (self.N, self.G, self.D), storage),
             (key_tape, (self.N, self.G, self.K), Float32),
             (query_tape, (self.N, self.G, self.K), Float32),
             (scale_tape, (self.N, self.G), Float32),
@@ -448,9 +453,10 @@ class Forward:
                             for k in cutlass.range_constexpr(K):
                                 for v in cutlass.range_constexpr(width):
                                     base_columns[k, v] += gj[k] * rj[v]
-                # The residual is rounded to BF16 before it is used, exactly as it is stored.
-                rounded = cute.make_rmem_tensor(width, BFloat16)
-                rounded.store(residual.load().to(BFloat16))
+                # The residual is rounded to its 16-bit type before it is used, exactly as it is
+                # stored.
+                rounded = cute.make_rmem_tensor(width, residual_tape.element_type)
+                rounded.store(residual.load().to(residual_tape.element_type))
                 residual.store(rounded.load().to(Float32))
                 for v in cutlass.range_constexpr(width):
                     read[v] += gamma * residual[v]
@@ -549,7 +555,7 @@ class Forward:
         assert D % 8 == 0 and K % 4 == 0
         assert (self.covariance_bytes * self.pw16) % 16 == 0
         smem = SmemAllocator()
-        dense = smem.allocate_tensor(BFloat16, cute.make_layout(
+        dense = smem.allocate_tensor(m.element_type, cute.make_layout(
             self.stages * self.dense_elems), byte_alignment=128)
         compact = smem.allocate_tensor(Float32, cute.make_layout(
             self.stages * self.compact_words), byte_alignment=16)

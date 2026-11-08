@@ -12,16 +12,17 @@ residuals u_i (the tapes),
 
 which are exact rearrangements of M_j^T q_j with M_j = T - sum_{i>j} kappa_i u_i^T, the same sums
 the forward kernel takes for its reads. One pass over M per launch; the local edges [lo, hi) are
-written to ``reads`` (rows of E) in BF16. One warp per group, every lane ``width`` columns.
+written to ``reads`` (rows of E) in M's 16-bit type (BF16 or FP16). One warp per group, every lane
+``width`` columns.
 """
 
 import math
 
 import cuda.bindings.driver as cuda
 import cutlass
-from cutlass import BFloat16, Boolean, Float32, Int32, Int64, cute
+from cutlass import Boolean, Float32, Int32, Int64, cute
 
-from .window_end import _load_dense, _store_bf16_vector, default_lane_width
+from .window_end import STORAGE_TYPES, _load_dense, _store_16bit_vector, default_lane_width
 
 
 class RecomputeRead:
@@ -38,12 +39,14 @@ class RecomputeRead:
     @cute.jit
     def __call__(self, m: cute.Tensor, queries: cute.Tensor, gains: cute.Tensor,
                  residuals: cute.Tensor, reads: cute.Tensor, stream: cuda.CUstream):
+        storage = m.element_type   # BF16 or FP16, M and the residual / read rows alike
+        assert storage in STORAGE_TYPES
         for tensor, shape, dtype in (
-            (m, (self.N, self.G, self.K, self.D), BFloat16),
+            (m, (self.N, self.G, self.K, self.D), storage),
             (queries, (self.E, self.N, self.G, self.K), Float32),
             (gains, (self.E, self.N, self.G, self.K), Float32),
-            (residuals, (self.E, self.N, self.G, self.D), BFloat16),
-            (reads, (self.E, self.N, self.G, self.D), BFloat16),
+            (residuals, (self.E, self.N, self.G, self.D), storage),
+            (reads, (self.E, self.N, self.G, self.D), storage),
         ):
             assert tensor.element_type == dtype
             assert tuple(tensor.shape) == shape
@@ -110,7 +113,7 @@ class RecomputeRead:
                             if cutlass.const_expr(uses):
                                 for v in cutlass.range_constexpr(width):
                                     read[v] += coef[j - lo, i] * residual[i, v]
-                        _store_bf16_vector(reads, (Int64(j) * ng + group) * D + Int64(d), read, width)
+                        _store_16bit_vector(reads, (Int64(j) * ng + group) * D + Int64(d), read, width)
 
 
 def make_read(E: int, N: int, G: int, K: int, D: int, *, sms: int, lo: int, hi: int,

@@ -1,16 +1,25 @@
 # Vendored from github.com/davidgonmar/depth-memory (commit 9a6865f, MIT License, Copyright (c) 2026
 # David Gonzalez Martinez), olmo_core/nn/ldm/backends/fast/; see cute_ldm/LICENSE_DEPTH_MEMORY.
 """The window-end kernel of the backward, and what the state kernels share: the staging and
-store helpers (BF16 and FP32 row loads and stores, the bulk global-to-shared copy, the packed
-symmetric offset) and the covariance VJP of one edge."""
+store helpers (16-bit and FP32 row loads and stores, the bulk global-to-shared copy, the packed
+symmetric offset) and the covariance VJP of one edge.
+
+16-bit storage: M, dM, the residual tape, the read / DY / DV tapes and the raw value gradient are
+BF16 or FP16, all of one launch in the same type (``STORAGE_TYPES``; FP16 for FP16 training). The
+kernels take it from their operands, and their shared staging panels and tensor-core operands use
+it too; all arithmetic stays FP32."""
 
 import math
 import operator
 
 import cuda.bindings.driver as cuda
 import cutlass
-from cutlass import BFloat16, Boolean, Float32, Int32, Int64, cute
+from cutlass import BFloat16, Boolean, Float16, Float32, Int32, Int64, cute
 from cutlass.utils import SmemAllocator
+
+
+# The 16-bit types the state tapes may be stored in (see the module doc).
+STORAGE_TYPES = (BFloat16, Float16)
 
 
 def _round_up(value, multiple):
@@ -74,11 +83,12 @@ def _wide(raw: cute.Tensor, width: cutlass.Constexpr):
 
 
 @cute.jit
-def _load_bf16(tensor: cute.Tensor, offset: Int64, width: cutlass.Constexpr):
+def _load_16bit(tensor: cute.Tensor, offset: Int64, width: cutlass.Constexpr):
+    """``width`` raw 16-bit elements (BF16 or FP16, the tensor's type) into registers."""
     source = cute.make_tensor(tensor.iterator + cute.assume(offset, divby=width),
                               cute.make_layout(width))
-    raw = cute.make_rmem_tensor(width, BFloat16)
-    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16,
+    raw = cute.make_rmem_tensor(width, tensor.element_type)
+    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), tensor.element_type,
                                num_bits_per_copy=16 * width)
     cute.copy(atom, source, raw)
     return raw
@@ -213,20 +223,21 @@ def _reduce_scatter_columns(values: cute.Tensor, width: cutlass.Constexpr,
 
 
 @cute.jit
-def _store_bf16_vector(tensor: cute.Tensor, offset: Int64, values: cute.Tensor,
-                       width: cutlass.Constexpr):
-    rounded = cute.make_rmem_tensor(width, BFloat16)
-    rounded.store(values.load().to(BFloat16))
+def _store_16bit_vector(tensor: cute.Tensor, offset: Int64, values: cute.Tensor,
+                        width: cutlass.Constexpr):
+    """Round ``width`` FP32 values to the tensor's 16-bit type and store them."""
+    rounded = cute.make_rmem_tensor(width, tensor.element_type)
+    rounded.store(values.load().to(tensor.element_type))
     destination = cute.make_tensor(tensor.iterator + cute.assume(offset, divby=width),
                                     cute.make_layout(width))
-    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16,
+    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), tensor.element_type,
                                num_bits_per_copy=16 * width)
     cute.copy(atom, rounded, destination)
 
 
 @cute.jit
 def _load_dense(dense: cute.Tensor, offset, width: cutlass.Constexpr):
-    return _wide(_load_bf16(dense, offset, width), width)
+    return _wide(_load_16bit(dense, offset, width), width)
 
 
 @cute.jit
@@ -266,7 +277,7 @@ class WindowEnd:
     edge's pre-write P in FP32, from the gain, denominator and forgetting tapes. covariance_grad
     is the FP32 gradient of the packed upper triangle of P.
 
-    The last edge's dq and -M dv use the committed BF16 m_end. In the first window the start state
+    The last edge's dq and -M dv use the committed 16-bit m_end. In the first window the start state
     is zero: the end state is rebuilt as sum(g r^T) in FP32 and m_start is written as exact zeros.
 
     Persistent CTAs: a producer warp stages batches of ``batch`` consecutive groups into two
@@ -287,7 +298,7 @@ class WindowEnd:
         self.lane_width = default_lane_width(D)
         self.words = K * (K + 1) // 2
         # One block per staged input, [rows][batch][row elements]; every block starts 16-byte
-        # aligned. BF16 elements:
+        # aligned. 16-bit elements:
         self.g_off = 0                                    # dM at the window's end, [batch][K][D]
         self.m_off = batch * K * D                        # M at the window's end, [batch][K][D]
         self.rr_off = self.m_off + (0 if first_window else batch * K * D)
@@ -625,8 +636,8 @@ class WindowEnd:
                             gradient[k, v] += query * yy[v]
                             gradient[k, v] -= key * vv[v]
                 for k in cutlass.range_constexpr(self.K):
-                    rounded = cute.make_rmem_tensor(width, BFloat16)
-                    rounded.store(gradient[k, None].load().to(BFloat16))
+                    rounded = cute.make_rmem_tensor(width, dm_start.element_type)
+                    rounded.store(gradient[k, None].load().to(dm_start.element_type))
                     _store_vector(dm_start, (Int64(group) * self.K + k) * self.D + Int64(d), rounded, width)
                     for v in cutlass.range_constexpr(width):
                         gradient[k, v] = Float32(rounded[v])
@@ -678,12 +689,12 @@ class WindowEnd:
             # This group's future DY and DV rows were staged before, so they can be overwritten.
             if inside:
                 dy_current = Int64(last) * dy.stride[0] + Int64(group) * dy.stride[2] + Int64(d)
-                _store_bf16_vector(dy, dy_current, yi, width)
+                _store_16bit_vector(dy, dy_current, yi, width)
                 dv_current = Int64(last) * dv.stride[0] + Int64(group) * dv.stride[2] + Int64(d)
-                _store_bf16_vector(dv, dv_current, vi, width)
+                _store_16bit_vector(dv, dv_current, vi, width)
                 raw = cute.make_rmem_tensor(width, Float32)
                 raw.store(vi.load() * write_scale)
-                _store_bf16_vector(grad_rawvalue, Int64(group) * self.D + Int64(d), raw, width)
+                _store_16bit_vector(grad_rawvalue, Int64(group) * self.D + Int64(d), raw, width)
             tile_accum = cute.make_rmem_tensor((self.K, 2), Float32)
             tile_accum.fill(0.0)
             memory = cute.make_rmem_tensor((self.K, width), Float32)
@@ -711,11 +722,11 @@ class WindowEnd:
                         for v in cutlass.range_constexpr(width):
                             tile_accum[k, 0] += memory[k, v] * yi[v]
                             tile_accum[k, 1] -= memory[k, v] * vi[v]
-                        zero = cute.make_rmem_tensor(width, BFloat16)
+                        zero = cute.make_rmem_tensor(width, m_start.element_type)
                         zero.fill(0.0)
                         _store_vector(m_start, (Int64(group) * self.K + k) * self.D + Int64(d), zero, width)
                     else:
-                        _store_bf16_vector(m_start, (Int64(group) * self.K + k) * self.D + Int64(d),
+                        _store_16bit_vector(m_start, (Int64(group) * self.K + k) * self.D + Int64(d),
                                            memory[k, None], width)
             reduced_memory = _reduce_scatter_columns(tile_accum, self.K, 1, lane)
             q_accum += reduced_memory[0]
@@ -851,6 +862,11 @@ class WindowEnd:
         for tensor in (future_dy, future_dv):
             assert tensor.stride[2] == self.D
         assert tuple(current_dy.stride) == (self.G * self.D, self.D, 1)
+        # One 16-bit storage type for every tape and state operand (the shared panel's type).
+        assert m_end.element_type in STORAGE_TYPES
+        for tensor in (dm_end, residuals, future_dy, future_dv, m_start, dm_start, current_dy,
+                       dy, dv, grad_rawvalue):
+            assert tensor.element_type == m_end.element_type
         for tensor, shape, dtype in (
             (live_p, (self.N, self.G, self.pw), Float32),
             (p_scratch, (self.E, self.N, self.G, self.words), Float32),
@@ -886,7 +902,7 @@ class WindowEnd:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
-        # The lane width is limited by the alignment of the BF16 tapes it writes.
+        # The lane width is limited by the alignment of the 16-bit tapes it writes.
         width = math.gcd(self.D, self.lane_width, min(
             dm_start.iterator.max_alignment, m_start.iterator.max_alignment,
             dy.iterator.max_alignment,
@@ -894,7 +910,7 @@ class WindowEnd:
         width = math.gcd(width, dy.stride[0], dy.stride[2])
         width = math.gcd(width, dv.iterator.max_alignment // 2, dv.stride[0], dv.stride[2])
         smem = SmemAllocator()
-        dense = smem.allocate_tensor(BFloat16, cute.make_layout(
+        dense = smem.allocate_tensor(m_end.element_type, cute.make_layout(
             self.stages * self.dense_elems), byte_alignment=128)
         compact = smem.allocate_tensor(Float32, cute.make_layout(
             self.stages * self.compact_words), byte_alignment=16)

@@ -2,8 +2,8 @@
 # David Gonzalez Martinez), olmo_core/nn/ldm/backends/fast/; see cute_ldm/LICENSE_DEPTH_MEMORY.
 """The interior of the window backward: one launch per edge of a window other than its last.
 
-Every warp stages its groups through two cp.async stages of its own. A BF16 panel holds the rows
-[M (K rows) | vi as three BF16 parts | the pool: residuals r_0..r_edge, this edge's read gradient
+Every warp stages its groups through two cp.async stages of its own. A 16-bit panel (BF16 or
+FP16, the tapes' storage type) holds the rows [M (K rows) | vi as three 16-bit parts | the pool: residuals r_0..r_edge, this edge's read gradient
 y_edge, DY rows y_edge+1..y_E-1] at a padded stride; an FP32 block holds the future value
 gradient, the covariance gradient C, the keys, gains and queries of the window, the
 future gain gradient, the forgetting factors, the denominator and the write scale. One mma.sync
@@ -12,8 +12,8 @@ and the outputs after it (the query, key, forgetting and scale gradients and the
 32 // K groups at once from per-warp finish slots.
 
 vi, the value gradient, is summed in FP32 per lane; dv and the raw value gradient are rounded from
-it. The contractions take vi as the exact sum of its three BF16 parts and accumulate in FP32 on
-the tensor cores.
+it. The contractions take vi as the sum of its three 16-bit parts and accumulate in FP32 on
+the tensor cores (exact in BF16; in FP16 to the subnormal floor 2^-24 of the last part).
 
 P from before this edge's update comes from the window end's FP32 scratch (p_scratch). ``current_dy``, this edge's
 read gradient, is staged into the pool and written once into the edge's slot of the DY history.
@@ -22,14 +22,15 @@ read gradient, is staged into the pool and written once into the edge's slot of 
 import math
 
 import cutlass
-from cutlass import BFloat16, Boolean, Float32, Int32, Int64, cute
+from cutlass import Boolean, Float32, Int32, Int64, cute
 from cutlass.utils import SmemAllocator
 
 from .window_end import (
-    _load_bf16,
+    _load_16bit,
     _load_dense,
     _load_fp32_vector,
-    _store_bf16_vector,
+    _store_16bit_vector,
+    STORAGE_TYPES,
     _store_fp32_row,
     covariance_vjp,
     default_lane_width,
@@ -59,11 +60,11 @@ def _cp_async_8(smem_addr: Int32, gmem_addr: Int64):
 
 
 @cute.jit
-def _store_bf16_raw(dst: cute.Tensor, offset, raw: cute.Tensor, width: cutlass.Constexpr):
-    """Store an already-rounded BF16 register vector (no further rounding)."""
+def _store_16bit_raw(dst: cute.Tensor, offset, raw: cute.Tensor, width: cutlass.Constexpr):
+    """Store an already-rounded 16-bit register vector (no further rounding)."""
     target = cute.make_tensor(dst.iterator + cute.assume(offset, divby=width),
                               cute.make_layout(width))
-    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16,
+    atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dst.element_type,
                                num_bits_per_copy=16 * width)
     cute.copy(atom, raw, target)
 
@@ -86,7 +87,7 @@ class Interior:
         self.width = math.gcd(D, self.lane_width)
         # Two shared stages per warp: one group computed while the next is staged.
         self.stages = 2
-        # BF16 panel rows [M (K rows) | vi in three BF16 parts | the pool (E + 1 rows): r_0..r_edge,
+        # 16-bit panel rows [M (K rows) | vi in three 16-bit parts | the pool (E + 1 rows): r_0..r_edge,
         # y_edge..y_E-1], padded to row_stride elements so that ldmatrix reads are free of bank
         # conflicts.
         self.d_pad = (D + 15) // 16 * 16
@@ -338,16 +339,18 @@ class Interior:
                  grad_write_scale: cute.Tensor, saved_p, current_dy: cute.Tensor, edge: Int32, stream):
         """The interior's arguments, with the saved covariance and this edge's read gradient."""
         words: cutlass.Constexpr = self.packed_words
+        storage = m.element_type   # the 16-bit type of every tape (the shared panel's type)
+        assert storage in STORAGE_TYPES
         for tensor, shape, dtype in (
-            (m, (self.N, self.G, self.K, self.D), BFloat16),
-            (residuals, (self.E, self.N, self.G, self.D), BFloat16),
-            (dy, (self.E, self.N, self.G, self.D), BFloat16),
+            (m, (self.N, self.G, self.K, self.D), storage),
+            (residuals, (self.E, self.N, self.G, self.D), storage),
+            (dy, (self.E, self.N, self.G, self.D), storage),
             (keys, (self.E, self.N, self.G, self.K), Float32),
             (gains, (self.E, self.N, self.G, self.K), Float32),
             (queries, (self.E, self.N, self.G, self.K), Float32),
             (future_value_grad, (self.E, self.N, self.G, self.D), Float32),
             (future_gain_grad, (self.E, self.N, self.G, self.K), Float32),
-            (dv, (self.E, self.N, self.G, self.D), BFloat16),
+            (dv, (self.E, self.N, self.G, self.D), storage),
             (forgetting_tape, (self.E, self.N, self.G), Float32),
             (denominators, (self.E, self.N, self.G), Float32),
             (saved_p, (self.E, self.N, self.G, words), Float32),
@@ -370,9 +373,9 @@ class Interior:
         assert tuple(grad_forgetting.stride[1:]) == (self.G, 1)
         assert grad_forgetting.stride[0] in (0, self.N * self.G)
         for tensor, shape, dtype in (
-            (current_dy, (self.N, self.G, self.D), BFloat16),
+            (current_dy, (self.N, self.G, self.D), storage),
             (write_scales, (self.N, self.G), Float32),
-            (grad_rawvalue, (self.N, self.G, self.D), BFloat16),
+            (grad_rawvalue, (self.N, self.G, self.D), storage),
             (grad_rawkey, (self.N, self.G, self.K), Float32),
             (grad_write_scale, (self.N, self.G), Float32),
         ):
@@ -462,8 +465,9 @@ class Interior:
                 _store_fp32_row(compact, Int64(uo + coefficient * K), u_row, K, math.gcd(K, 4))
             for j in cutlass.range_constexpr(min(32, E - 32 * bank)):
                 alphas[32 * bank + j] = cute.arch.shuffle_sync(alpha_lane, j)
-        # vi for this lane's columns, the dv and raw value gradient outputs, and vi's exact split
-        # into three BF16 rows of the panel.
+        # vi for this lane's columns, the dv and raw value gradient outputs, and vi's split into
+        # three 16-bit rows of the panel.
+        half = dense.element_type
         full: cutlass.Constexpr = self.D % (32 * width) == 0
         for tile in cutlass.range_constexpr(cute.ceil_div(self.D, 32 * width)):
             d = tile * (32 * width) + lane * width
@@ -471,8 +475,8 @@ class Interior:
             if inside:
                 offset = current * self.D + Int64(d)
                 # y_i, staged from current_dy, into its DY history slot.
-                y_raw = _load_bf16(dense, doff + (self.pool_row + edge + 1) * S + d, width)
-                _store_bf16_raw(dy, offset, y_raw, width)
+                y_raw = _load_16bit(dense, doff + (self.pool_row + edge + 1) * S + d, width)
+                _store_16bit_raw(dy, offset, y_raw, width)
                 # One vector load of the future value gradient keeps the live ranges short.
                 vi = _load_fp32_vector(compact, coff + self.future_value_grad_off + d, width)
                 for j in cutlass.range_constexpr(E):
@@ -480,24 +484,24 @@ class Interior:
                         yj = _load_dense(dense, doff + (self.pool_row + j + 1) * S + d, width)
                         for v in cutlass.range_constexpr(width):
                             vi[v] += alphas[j] * yj[v]
-                hi = cute.make_rmem_tensor(width, BFloat16)
-                hi.store(vi.load().to(BFloat16))
+                hi = cute.make_rmem_tensor(width, half)
+                hi.store(vi.load().to(half))
                 rem = cute.make_rmem_tensor(width, Float32)
                 rem.store(vi.load() - hi.load().to(Float32))
-                mid = cute.make_rmem_tensor(width, BFloat16)
-                mid.store(rem.load().to(BFloat16))
-                low = cute.make_rmem_tensor(width, BFloat16)
+                mid = cute.make_rmem_tensor(width, half)
+                mid.store(rem.load().to(half))
+                low = cute.make_rmem_tensor(width, half)
                 low.fill(0.0)
                 rem2 = cute.make_rmem_tensor(width, Float32)
                 rem2.store(rem.load() - mid.load().to(Float32))
-                low.store(rem2.load().to(BFloat16))
-                _store_bf16_raw(dense, doff + self.split_row * S + d, hi, width)
-                _store_bf16_raw(dense, doff + (self.split_row + 1) * S + d, mid, width)
-                _store_bf16_raw(dense, doff + (self.split_row + 2) * S + d, low, width)
-                _store_bf16_vector(dv, current * self.D + Int64(d), vi, width)
+                low.store(rem2.load().to(half))
+                _store_16bit_raw(dense, doff + self.split_row * S + d, hi, width)
+                _store_16bit_raw(dense, doff + (self.split_row + 1) * S + d, mid, width)
+                _store_16bit_raw(dense, doff + (self.split_row + 2) * S + d, low, width)
+                _store_16bit_vector(dv, current * self.D + Int64(d), vi, width)
                 raw = cute.make_rmem_tensor(width, Float32)
                 raw.store(vi.load() * write_scale)
-                _store_bf16_vector(grad_rawvalue, Int64(group) * self.D + Int64(d), raw, width)
+                _store_16bit_vector(grad_rawvalue, Int64(group) * self.D + Int64(d), raw, width)
         cute.arch.sync_warp()
         acc = cute.make_rmem_tensor((4, self.m_tiles, self.n_tiles), Float32)
         acc.fill(0.0)
@@ -559,14 +563,15 @@ class Interior:
         B [n_tiles*8 x d_pad] rows = vi_hi, vi_mid, vi_lo, pool rows.
         """
         S: cutlass.Constexpr = self.row_stride
-        mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)))
+        half = dense.element_type
+        mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op(half, Float32, (16, 8, 16)))
         thr = mma.get_slice(lane)
         ac = thr.partition_A(cute.make_identity_tensor((16, 16)))
         bc = thr.partition_B(cute.make_identity_tensor((8, 16)))
         ld_a = cute.make_tiled_copy_A(cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), BFloat16), mma).get_slice(lane)
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), half), mma).get_slice(lane)
         ld_b = cute.make_tiled_copy_B(cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), BFloat16), mma).get_slice(lane)
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), half), mma).get_slice(lane)
         sa = cute.make_tensor(dense.iterator + cute.assume(doff, divby=8),
                               cute.make_layout((self.m_tiles * 16, self.d_pad), stride=(S, 1)))
         sb = cute.make_tensor(dense.iterator + cute.assume(doff + self.b_row * S, divby=8),
@@ -578,13 +583,13 @@ class Interior:
         for step in cutlass.range_constexpr(self.k_steps):
             a_frags = []
             for mt in cutlass.range_constexpr(self.m_tiles):
-                a = cute.make_rmem_tensor(ac.shape, BFloat16)
+                a = cute.make_rmem_tensor(ac.shape, half)
                 cute.copy(ld_a, ld_a.partition_S(cute.local_tile(sa, (16, 16), (mt, step))),
                           ld_a.retile(a))
                 a_frags.append(a)
             b_frags = []
             for nt in cutlass.range_constexpr(self.n_tiles):
-                b = cute.make_rmem_tensor(bc.shape, BFloat16)
+                b = cute.make_rmem_tensor(bc.shape, half)
                 cute.copy(ld_b, ld_b.partition_S(cute.local_tile(sb, (8, 16), (nt, step))),
                           ld_b.retile(b))
                 b_frags.append(b)
@@ -743,7 +748,7 @@ class Interior:
         width = math.gcd(D, self.lane_width, output_alignment // 2)
         assert D % 8 == 0 and K % 4 == 0
         smem = SmemAllocator()
-        dense = smem.allocate_tensor(BFloat16, cute.make_layout(
+        dense = smem.allocate_tensor(m.element_type, cute.make_layout(
             self.warps * self.stages * self.dense_elems), byte_alignment=128)
         compact = smem.allocate_tensor(Float32, cute.make_layout(
             self.warps * self.stages * self.compact_words), byte_alignment=16)
@@ -775,7 +780,7 @@ class Interior:
                 if index < total:
                     row = index // tail
                     offset = (row // self.dense_rows) * self.dense_elems + (row % self.dense_rows) * self.row_stride
-                    dense[dense_base + offset + D + index % tail] = BFloat16(0.0)
+                    dense[dense_base + offset + D + index % tail] = m.element_type(0.0)
         cute.arch.sync_warp()
         stride = Int32(self.blocks) * self.warps
         first = Int32(bid) * self.warps + warp
