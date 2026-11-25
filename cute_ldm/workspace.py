@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -138,8 +139,48 @@ _STATIC_ARGS = {}
 # The dtypes the forward may keep the running covariance in.
 RUNNING_COVARIANCE_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 # The 16-bit types of M, dM, the residual / read / DY / DV tapes and the value gradients: BF16, or
-# FP16 for FP16 training (the kernels take it from their operands).
+# FP16 (the kernels take it from their operands) -- for FP16 training, or for BF16 training with
+# ``grad_scaling``.
 STORAGE_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+FP16_MAX = 65504.0
+# grad_scaling: the largest |cotangent| after scaling. FP16 keeps 2^11 above it for cotangents that
+# outgrow the scale within a backward and for dM, which sums ~2 |q| |dy| per edge over the depth.
+GRAD_SCALE_TARGET = 2.0 ** 5
+
+
+def _scaled_cotangent(grad, scale):
+    """grad_scaling: (grad * scale in FP16, saturated at its range; max |grad|)."""
+    grad = grad.float()
+    return (grad * scale).clamp(-FP16_MAX, FP16_MAX).to(torch.float16), grad.abs().amax()
+
+
+def _unscaled(grads, scale):
+    """grad_scaling: every gradient / scale in FP32 with its non-finite entries zeroed, and how
+    many were."""
+    inverse, out, bad = scale.reciprocal(), [], 0
+    for grad in grads:
+        grad = grad.float() * inverse
+        finite = torch.isfinite(grad)
+        bad = bad + finite.logical_not().sum()
+        out.append(torch.where(finite, grad, 0.0))
+    return out, bad
+
+
+_FUSED = {"scaled_cotangent": _scaled_cotangent, "unscaled": _unscaled}
+_COMPILED = {}
+
+
+def _fused(name):
+    """``name``'s function compiled (Inductor fuses its elementwise passes and reductions into
+    one or two kernels per tensor); eager with CUTE_LDM_EAGER_SCALING=1 or if compiling fails."""
+    if os.environ.get("CUTE_LDM_EAGER_SCALING") == "1":
+        return _FUSED[name]
+    if name not in _COMPILED:
+        try:
+            _COMPILED[name] = torch.compile(_FUSED[name], dynamic=False)
+        except Exception:  # pragma: no cover - Inductor unavailable
+            _COMPILED[name] = _FUSED[name]
+    return _COMPILED[name]
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -150,11 +191,22 @@ def _aligned(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class CuteDepthMemoryWorkspace:
-    """The tapes and buffers of ``total_edges`` LDM steps for ``n`` tokens (see module doc)."""
+    """The tapes and buffers of ``total_edges`` LDM steps for ``n`` tokens (see module doc).
+
+    ``grad_scaling``: FP16 storage under BF16 (or FP32) training. FP16 holds the backward's
+    gradient tapes (dM, DY, DV, the value gradient) as well as M, and unscaled activation
+    gradients (~1e-7 and below) underflow it. Every backward therefore scales its cotangents by
+    a power of two, ``grad_scale``, and divides the input gradients by it (FP32 out); the backward
+    is linear in the cotangents, so this is exact up to rounding. The scale maps the larger of the
+    previous backward's largest |cotangent| and this backward's first one to GRAD_SCALE_TARGET.
+    Scaled cotangents saturate at FP16's range; non-finite input gradients are zeroed, counted in
+    ``grad_nonfinite``, and make the next backward's scale 16x smaller. FP16 training brings
+    its own loss scale and leaves this off.
+    """
 
     def __init__(self, *, total_edges: int, groups: int, key_dim: int, value_dim: int,
                  alpha: float = 1.0, span: int = 4, running_covariance_dtype: str = "float32",
-                 storage_dtype: str = "bfloat16"):
+                 storage_dtype: str = "bfloat16", grad_scaling: bool = False):
         if key_dim not in (4, 8, 16):
             raise ValueError("cute_ldm: the key dimension must be 4, 8 or 16")
         if running_covariance_dtype != "float32":
@@ -168,6 +220,9 @@ class CuteDepthMemoryWorkspace:
         if storage_dtype not in STORAGE_DTYPES:
             raise ValueError(f"cute_ldm: storage_dtype must be one of {sorted(STORAGE_DTYPES)}")
         self.storage = STORAGE_DTYPES[storage_dtype]
+        if grad_scaling and self.storage != torch.float16:
+            raise ValueError("cute_ldm: grad_scaling is for FP16 storage")
+        self.grad_scaling = bool(grad_scaling)
         self.n = None
 
     # -- buffers -------------------------------------------------------------------------------
@@ -205,6 +260,13 @@ class CuteDepthMemoryWorkspace:
         self.future_value_grad = empty((rows, n, g, d))
         self.dy, self.dv = [empty((rows, n, g, d), self.storage) for _ in range(2)]
         self.future_gain_grad = empty((rows, n, g, k))
+        # grad_scaling: this backward's scale, its largest |cotangent| so far, the previous
+        # backward's, and the non-finite input gradients zeroed so far (all on the device: no sync)
+        self.grad_scale = torch.ones((), device=self.device)
+        self.grad_amax = torch.zeros((), device=self.device)
+        self.grad_amax_prev = torch.zeros((), device=self.device)
+        self.grad_nonfinite = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._nonfinite_before = torch.zeros((), dtype=torch.int64, device=self.device)
         self._allocate_reads(n)
         self._register_buffers()
 
@@ -248,6 +310,56 @@ class CuteDepthMemoryWorkspace:
         start = edge // self.span * self.span
         return start, min(start + self.span, self.total_edges)
 
+    # -- storage types and the gradient scale (grad_scaling) ----------------------------------
+    def _to_storage(self, value):
+        """A written value in the storage type; FP16 from a wider type saturates at its largest
+        finite value instead of overflowing to inf."""
+        if self.storage == torch.float16 and value.dtype != torch.float16:
+            value = value.clamp(-FP16_MAX, FP16_MAX)
+        return value.to(self.storage)
+
+    def _begin_backward(self, read_grad) -> None:
+        """grad_scaling, at the backward's first edge: this backward's scale."""
+        if not self.grad_scaling:
+            return
+        amax = torch.maximum(read_grad.detach().abs().amax().float(), self.grad_amax_prev)
+        exponent = torch.floor(torch.log2(GRAD_SCALE_TARGET / amax.clamp_min(1e-30))).clamp(-100, 100)
+        self.grad_scale.copy_(torch.where(amax > 0, torch.exp2(exponent), torch.ones_like(amax)))
+        self.grad_amax.zero_()
+        self._nonfinite_before.copy_(self.grad_nonfinite)
+
+    def _end_backward(self) -> None:
+        """grad_scaling, after the backward's last edge (edge 0): the next backward's reference
+        amax, 16x larger (a 16x smaller scale) if this backward zeroed non-finite gradients."""
+        if not self.grad_scaling:
+            return
+        overflowed = self.grad_nonfinite > self._nonfinite_before
+        self.grad_amax_prev.copy_(torch.where(overflowed, self.grad_amax * 16, self.grad_amax))
+
+    def _cotangent(self, read_grad):
+        """A read's cotangent as the backward's 16-bit tape (scaled under grad_scaling)."""
+        if not self.grad_scaling:
+            return read_grad.to(self.storage)
+        scaled, amax = _fused("scaled_cotangent")(read_grad.detach(), self.grad_scale)
+        torch.maximum(self.grad_amax, amax, out=self.grad_amax)
+        return scaled
+
+    def _input_grads(self, raw_key_grad, query_grad, raw_value_grad, scale_grad, forgetting_grad):
+        """The step's input gradients; under grad_scaling unscaled to FP32 (an unscaled FP16 value
+        gradient would underflow), non-finite entries zeroed and counted."""
+        grads = (raw_key_grad, query_grad, raw_value_grad, scale_grad, forgetting_grad)
+        if not self.grad_scaling:
+            return grads
+        out, bad = _fused("unscaled")(grads, self.grad_scale)
+        self.grad_nonfinite += bad
+        return tuple(out)
+
+    def numerics_stats(self) -> dict:
+        """grad_scaling: the last backward's scale and largest |cotangent|, and the non-finite
+        input gradients zeroed so far (device tensors)."""
+        return dict(grad_scale=self.grad_scale, grad_amax=self.grad_amax_prev,
+                    grad_nonfinite=self.grad_nonfinite)
+
     # -- forward -------------------------------------------------------------------------------
     @torch.no_grad()
     def forward(self, edge, khat, query, value, scale, forgetting) -> torch.Tensor:
@@ -262,7 +374,7 @@ class CuteDepthMemoryWorkspace:
         forgetting = torch.broadcast_to(forgetting.float(), (n, g))
         if forgetting.stride() != (0, 1):
             forgetting = _aligned(forgetting)
-        value = self._padded(value.to(self.storage).contiguous().view(n, g, self.value_dim))
+        value = self._padded(self._to_storage(value).contiguous().view(n, g, self.value_dim))
         read = torch.empty_like(value)
         tapes = [self.keys[edge], self.queries[edge], self.scales[edge], self.forgetting_tape[edge]]
         sizes = (end - start, n, g, k, self.padded_value_dim)
@@ -280,6 +392,7 @@ class CuteDepthMemoryWorkspace:
         if edge == self.total_edges - 1 and not self.grad_loaded:
             self.dm.zero_()
             self.covariance_grad.zero_()
+            self._begin_backward(read_grad)
         start, end = self._window(edge)
         zero_start = start == 0 and not self.state_loaded
         count = end - start
@@ -293,7 +406,7 @@ class CuteDepthMemoryWorkspace:
         raw_key_grad = torch.empty((n, g, k), device=self.device, dtype=torch.float32)
         scale_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
         current_dy = _aligned(self._padded(
-            read_grad.to(self.storage).reshape(n, g, self.value_dim)))
+            self._cotangent(read_grad).reshape(n, g, self.value_dim)))
         if edge == end - 1:
             # the window end; its future window is the next one (processed just before)
             fs, fe = end, min(end + self.span, self.total_edges)
@@ -320,8 +433,10 @@ class CuteDepthMemoryWorkspace:
                      self.forgetting_tape[start:end], self.denominators[start:end],
                      forgetting_output, self.scales[edge], raw_value_grad, raw_key_grad,
                      scale_grad, scratch, current_dy], edge - start, training=True)
-        return (raw_key_grad, query_grad, self._unpadded(raw_value_grad), scale_grad,
-                forgetting_grad.sum(0))
+        if edge == 0:
+            self._end_backward()
+        return self._input_grads(raw_key_grad, query_grad, self._unpadded(raw_value_grad),
+                                 scale_grad, forgetting_grad.sum(0))
 
     # -- reads under activation recompute ------------------------------------------------------
     @torch.no_grad()
@@ -357,6 +472,8 @@ class CuteDepthMemoryWorkspace:
 
     def load_grad(self, dm: torch.Tensor, covariance_grad: torch.Tensor) -> None:
         """Start the next backward from dL/dM and dL/dP (packed, fp32) at the segment's end."""
+        if self.grad_scaling:
+            raise NotImplementedError("cute_ldm: grad_scaling with segments (a carried dM)")
         self.dm.copy_(dm.view_as(self.dm))
         self.covariance_grad.copy_(covariance_grad.view_as(self.covariance_grad))
         self.grad_loaded = True
@@ -366,6 +483,8 @@ class CuteDepthMemoryWorkspace:
         """dL/dM and dL/dP at the segment's start, after the backward of its first edge: dM with the
         first window's own terms folded in, sum_e q_e dy_e^T - kbar_e dv_e^T over its edges (what
         the previous window's window-end would add from its future tapes)."""
+        if self.grad_scaling:
+            raise NotImplementedError("cute_ldm: grad_scaling with segments (a carried dM)")
         if not fold:  # (tests: the fold is needed)
             return self.dm.float(), self.covariance_grad
         count = min(self.span, self.total_edges)
@@ -424,10 +543,31 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
     the group before it. Every edge of the window must lie in that group or later
     (``layout``): windows of about one group's size (2 edges at 2 layers per group, 3 when they
     end inside a group).
+
+    Records. A record holds the edge's u bit for bit: FP16 u in a BF16 stream is stored as its
+    bits (an FP32 stream holds a 16-bit u exactly), so the backward unwinds with the u the forward
+    committed into M.
+
+    Checkpoints (``checkpoint_interval`` > 0). The unwinding subtracts each window's writes from a
+    later, larger M, so its rounding error follows the largest M of the chain: a burst of large
+    writes deep in the stack degrades every state before it. Every ``checkpoint_interval`` edges
+    (a multiple of the span, at a boundary b that is a backward window start) the forward copies
+    its committed M_b (the state after edges < b) to pinned host memory (``checkpoint_offload``,
+    on a side stream) or to the device; the backward replaces its unwound M_b by that copy right
+    after the window-end launch that reaches b. The unwinding then never runs across more than
+    one interval. P is not checkpointed: its FP32 unwinding is accurate to ~1e-6.
     """
 
-    def __init__(self, **settings):
+    def __init__(self, *, checkpoint_interval: int = 0, checkpoint_offload: bool = True,
+                 checkpoint_prefetch: bool = False, **settings):
         super().__init__(**settings)
+        if checkpoint_interval < 0:
+            raise ValueError("cute_ldm recompute: checkpoint_interval must be >= 0")
+        self.checkpoint_interval = int(checkpoint_interval)
+        self.checkpoint_offload = bool(checkpoint_offload)
+        # offloaded checkpoints: copy the next one the backward needs into a device staging buffer
+        # (one checkpoint's size) an interval ahead, so the restore is a device copy
+        self.checkpoint_prefetch = bool(checkpoint_prefetch) and self.checkpoint_offload
         self.windows = None
 
     # -- layout --------------------------------------------------------------------------------
@@ -455,6 +595,18 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             s = e
         self.windows = windows
         self.window_of = [w for w, (s, e) in enumerate(windows) for _ in range(s, e)]
+        starts = {s for s, _ in windows}
+        self.checkpoints = []
+        if self.checkpoint_interval:
+            if self.checkpoint_interval % self.span:
+                raise ValueError(f"cute_ldm recompute: checkpoint_interval {self.checkpoint_interval} "
+                                 f"is not a multiple of the span {self.span}")
+            for boundary in range(self.checkpoint_interval, L, self.checkpoint_interval):
+                if boundary not in starts:
+                    raise ValueError(f"cute_ldm recompute: checkpoint boundary {boundary} is not a "
+                                     f"backward window start (windows {windows})")
+                self.checkpoints.append(boundary)
+        self.checkpoint_index = {b: i for i, b in enumerate(self.checkpoints)}
         self.width = width
         self.record_slots = max(count for _, count in groups)
         g, k = self.groups, self.key_dim
@@ -565,6 +717,84 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         self._written = None       # (edge, slot, row) the forward just wrote, for put_record
         self._final_consumed = False   # the last edge's read, taken once after the forward
         self.grad_stash = {}       # edge -> the step's input gradients, from the read's backward
+        self._allocate_checkpoints(n)
+
+    def _allocate_checkpoints(self, n: int) -> None:
+        """The M copies at the checkpoint boundaries, [checkpoint, n, G, K, D] in the storage type."""
+        count = len(self.checkpoints)
+        self.checkpoint_m, self._checkpoint_pending, self._staged = None, None, None
+        if not count:
+            return
+        shape = (count, n, self.groups, self.key_dim, self.padded_value_dim)
+        if self.checkpoint_offload:
+            self.checkpoint_m = torch.empty(shape, dtype=self.storage, pin_memory=True)
+        else:
+            self.checkpoint_m = torch.empty(shape, dtype=self.storage, device=self.device)
+        self._checkpoint_stream = torch.cuda.Stream(device=self.device)
+        self._checkpoint_done = [torch.cuda.Event() for _ in range(count)]
+        self._staged, self._staged_done = None, torch.cuda.Event()
+        if self.checkpoint_prefetch:
+            self.checkpoint_staging = torch.empty(shape[1:], dtype=self.storage, device=self.device)
+
+    def _prefetch_checkpoint(self, index: int) -> None:
+        """Copy checkpoint ``index`` into the staging buffer on the side stream, after the device
+        copy out of it that the main stream has queued (the previous restore)."""
+        side = self._checkpoint_stream
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self.checkpoint_staging.copy_(self.checkpoint_m[index], non_blocking=True)
+            self._staged_done.record(side)
+        self._staged = index
+
+    def _save_checkpoint(self, index: int) -> None:
+        """Copy the committed M (the state at boundary ``checkpoints[index]``) on the side stream;
+        the next launch that writes M waits for it (_wait_checkpoint)."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("cute_ldm recompute: M checkpoints inside a CUDA graph capture")
+        side = self._checkpoint_stream
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self.checkpoint_m[index].copy_(self.m, non_blocking=True)
+            self._checkpoint_done[index].record(side)
+        self._checkpoint_pending = index
+
+    def _wait_checkpoint(self) -> None:
+        """Before a launch that writes M: the pending copy of M has finished."""
+        if self._checkpoint_pending is not None:
+            torch.cuda.current_stream().wait_event(self._checkpoint_done[self._checkpoint_pending])
+            self._checkpoint_pending = None
+
+    def _restore_checkpoint(self, boundary: int) -> None:
+        """The backward reached ``boundary``: its unwound M becomes the forward's copy."""
+        index = self.checkpoint_index[boundary]
+        stream = torch.cuda.current_stream()
+        if self._staged == index:
+            stream.wait_event(self._staged_done)
+            self.m.copy_(self.checkpoint_staging)
+        else:
+            stream.wait_event(self._checkpoint_done[index])
+            self.m.copy_(self.checkpoint_m[index], non_blocking=True)
+        self._staged = None
+        if self.checkpoint_prefetch and index > 0:
+            self._prefetch_checkpoint(index - 1)
+
+    # -- u between the storage type and the stream's ------------------------------------------
+    def _u_to_record(self, u, dtype):
+        """u (storage type) as the stream's ``dtype``, without rounding: the bits when the widths
+        match (FP16 in a BF16 stream), else the value (exact in an FP32 stream)."""
+        if u.dtype == dtype:
+            return u
+        if u.dtype.itemsize == dtype.itemsize:
+            return u.contiguous().view(dtype)
+        return u.to(dtype)
+
+    def _u_from_record(self, u):
+        """The inverse of _u_to_record: a record's u in the storage type."""
+        if u.dtype == self.storage:
+            return u
+        if u.dtype.itemsize == self.storage.itemsize:
+            return u.contiguous().view(self.storage)
+        return u.to(self.storage)
 
     def _backward_rows(self) -> int:
         return max(end - start for start, end in self.windows)
@@ -629,7 +859,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         n, t = self.n, self._forward_tapes
         j = edge - self.group_ranges[self.group_of[edge]][0]
         u = self._unpadded(t["residuals"][slot, local]).reshape(records.shape[1:])
-        records[j].copy_(u)
+        records[j].copy_(self._u_to_record(u, records.dtype))
         packed = torch.cat([t["keys"][slot, local].reshape(n, -1),
                             t["queries"][slot, local].reshape(n, -1),
                             t["gains"][slot, local].reshape(n, -1),
@@ -656,8 +886,8 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             slot = self._place(self.window_of[e])
             local = e - self.windows[self.window_of[e]][0]
             j = e - first
-            u = records[j].reshape(n, g, self.value_dim)
-            self.residuals[slot, local].copy_(self._padded(u.to(self.storage)))
+            u = self._u_from_record(records[j].reshape(n, g, self.value_dim))
+            self.residuals[slot, local].copy_(self._padded(u))
             words = self._get_small(records, j)
             keys, queries, gains, den, forget, scale = words.split(self.small_parts, dim=1)
             self.keys[slot, local].copy_(keys.reshape(n, g, k))
@@ -692,7 +922,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             forgetting = torch.broadcast_to(forgetting.float(), (n, g))
             if forgetting.stride() != (0, 1):
                 forgetting = _aligned(forgetting)
-            value = self._padded(value.to(self.storage).contiguous().view(n, g, self.value_dim))
+            value = self._padded(self._to_storage(value).contiguous().view(n, g, self.value_dim))
             read = torch.empty_like(value)
             local = edge - start
             t = self._forward_tapes
@@ -701,10 +931,14 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             sizes = (end - start, n, g, k, self.padded_value_dim)
             options = (("first_window", start == 0), ("running_covariance_dtype", self.running_covariance_dtype))
             count = end - start
+            if local == count - 1:
+                self._wait_checkpoint()   # this launch commits the window into M
             _launch("forward", sizes,
                     [self.m, self.p, raw_key, query, value, scale, forgetting, t["gains"][slot, :count],
                      t["residuals"][slot, :count], t["denominators"][slot, :count], read, *tapes],
                     local, options=options, training=True)
+            if edge + 1 in self.checkpoint_index:
+                self._save_checkpoint(self.checkpoint_index[edge + 1])
             self._written = (edge, slot, local)
             self._next = edge + 1
             self._pending = (edge, read)
@@ -779,6 +1013,10 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         if edge == self.total_edges - 1 and not self.grad_loaded:
             self.dm.zero_()
             self.covariance_grad.zero_()
+            self._begin_backward(read_grad)
+            if self.checkpoint_prefetch and self.checkpoints:
+                self._prefetch_checkpoint(len(self.checkpoints) - 1)
+        self._wait_checkpoint()   # the window-end launches write M
         zero_start = start == 0 and not self.state_loaded
         count = end - start
         scratch = self.p_scratch[:count]
@@ -790,7 +1028,7 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
         raw_value_grad = torch.empty((n, g, d), device=self.device, dtype=self.storage)
         raw_key_grad = torch.empty((n, g, k), device=self.device, dtype=torch.float32)
         scale_grad = torch.empty((n, g), device=self.device, dtype=torch.float32)
-        current_dy = _aligned(self._padded(read_grad.to(self.storage).reshape(n, g, self.value_dim)))
+        current_dy = _aligned(self._padded(self._cotangent(read_grad).reshape(n, g, self.value_dim)))
         if edge == end - 1:
             if w + 1 < len(self.windows):
                 fslot = self._slot(w + 1)
@@ -811,6 +1049,8 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
                     options=(("first_window", zero_start),), training=True)
             self._state_edge = start
             self._drop_reads(w, from_end=True)   # the state has left the window's end
+            if start in self.checkpoint_index:
+                self._restore_checkpoint(start)
         else:
             _launch("interior", (count, n, g, k, d),
                     [self.m, self.residuals[slot, :count], self.dy[:count], self.keys[slot, :count],
@@ -825,8 +1065,9 @@ class CuteRecomputeWorkspace(CuteDepthMemoryWorkspace):
             self._drop_reads(w)      # the window's backward is done
         if edge == 0:
             self._phase, self._next = "forward", 0
-        return (raw_key_grad, query_grad, self._unpadded(raw_value_grad), scale_grad,
-                forgetting_grad.sum(0))
+            self._end_backward()
+        return self._input_grads(raw_key_grad, query_grad, self._unpadded(raw_value_grad),
+                                 scale_grad, forgetting_grad.sum(0))
 
     def _drop_reads(self, window, from_end=None):
         for key in [key for key in self._read_cache if key[0] == window
